@@ -6,6 +6,7 @@ const startBtn = document.getElementById('start-btn');
 const stopBtn = document.getElementById('stop-btn');
 const downloadLink = document.getElementById('download-link');
 const copyBtn = document.getElementById('copy-btn');
+const themeToggleBtn = document.getElementById('theme-toggle');
 
 let ws = null;
 
@@ -30,7 +31,14 @@ function appendStatus(text) {
 }
 
 function appendOutput(text) {
-  outputPre.textContent += text;
+  // 段落空一行：将双换行规范化为两个换行；
+  // 若是单换行则保持；在显示时文本区域已使用 pre-wrap
+  // 若上一次末尾非空且当前片段以换行开头，保持原样
+  // 仅在出现段落断句（\n\n 或 \r\n\r\n）时确保两个换行
+  const normalized = text
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n');
+  outputPre.textContent += normalized;
   outputPre.scrollTop = outputPre.scrollHeight;
 }
 
@@ -177,5 +185,33 @@ function restoreFormFromLocalStorage() {
 }
 
 restoreFormFromLocalStorage();
+
+// 主题切换与持久化
+const THEME_KEY = 'audiototxt_theme';
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (theme === 'light') {
+    root.setAttribute('data-theme', 'light');
+    themeToggleBtn && (themeToggleBtn.textContent = '深色主题');
+  } else {
+    root.removeAttribute('data-theme');
+    themeToggleBtn && (themeToggleBtn.textContent = '浅色主题');
+  }
+}
+function initTheme() {
+  try {
+    const saved = localStorage.getItem(THEME_KEY);
+    applyTheme(saved === 'light' ? 'light' : 'dark');
+  } catch (_) {
+    applyTheme('dark');
+  }
+}
+themeToggleBtn?.addEventListener('click', () => {
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  const next = isLight ? 'dark' : 'light';
+  applyTheme(next);
+  try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
+});
+initTheme();
 
 

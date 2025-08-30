@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -8,7 +8,12 @@
 </head>
 <body>
 <div class="container">
-    <h1>AudioToTxt</h1>
+    <div class="topbar">
+        <h1>AudioToTxt</h1>
+        <div>
+            <button type="button" id="theme-toggle" class="actions">浅色主题</button>
+        </div>
+    </div>
     <p>选择来源并开始转写。转写过程中的文本会实时显示。</p>
 
     <form id="task-form">
@@ -90,7 +95,7 @@
         <div class="output-header">
             <span>实时转写</span>
             <div class="output-actions">
-                <button type="button" id="copy-btn" class="ghost">复制全文</button>
+                <button type="button" id="copy-btn" class="actions">复制全文</button>
                 <a id="download-link" style="display:none" target="_blank">下载完整文本</a>
             </div>
         </div>

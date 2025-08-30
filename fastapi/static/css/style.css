@@ -7,12 +7,26 @@
   --accent: #22d3ee;
 }
 
+:root[data-theme="light"] {
+  --bg: #f5f7fb;
+  --card: #ffffff;
+  --text: #1f2937;
+  --muted: #6b7280;
+  --primary: #2563eb;
+  --accent: #06b6d4;
+}
+
 * { box-sizing: border-box; }
 
 body {
   margin: 0;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Noto Sans, "Apple Color Emoji", "Segoe UI Emoji";
   background: linear-gradient(180deg, #0e0f14, #0b0c10);
+  color: var(--text);
+}
+
+:root[data-theme="light"] body {
+  background: linear-gradient(180deg, #f8fafc, #eef2f7);
   color: var(--text);
 }
 
@@ -34,6 +48,13 @@ form {
   padding: 16px;
 }
 
+:root[data-theme="light"] form,
+:root[data-theme="light"] .status-area,
+:root[data-theme="light"] .output-card {
+  border: 1px solid rgba(0,0,0,0.08);
+  background: var(--card);
+}
+
 .field-row {
   display: flex;
   align-items: center;
@@ -53,6 +74,15 @@ input[type="text"], input[type="url"], input[type="password"], select {
   border: 1px solid rgba(255,255,255,0.08);
   color: var(--text);
   border-radius: 8px;
+}
+
+:root[data-theme="light"] input[type="text"],
+:root[data-theme="light"] input[type="url"],
+:root[data-theme="light"] input[type="password"],
+:root[data-theme="light"] select {
+  background: #ffffff;
+  border: 1px solid rgba(0,0,0,0.12);
+  color: var(--text);
 }
 
 .actions {
@@ -83,6 +113,10 @@ button[disabled] {
   margin: 14px 0;
 }
 
+:root[data-theme="light"] .divider {
+  background: rgba(0,0,0,0.08);
+}
+
 .status-area {
   background: var(--card);
   border: 1px solid rgba(255,255,255,0.06);
@@ -111,21 +145,33 @@ button[disabled] {
   border-bottom: 1px solid rgba(255,255,255,0.06);
 }
 
+:root[data-theme="light"] .output-header {
+  border-bottom: 1px solid rgba(0,0,0,0.08);
+}
+
 .output {
   padding: 12px;
   margin: 0;
-  height: 360px;
+  height: 80vh;
   overflow: auto;
   white-space: pre-wrap;
+  font-size: 18px;
+  line-height: 1.8;
 }
 
 a { color: #7dd3fc; text-decoration: none; }
 a:hover { text-decoration: underline; }
 
+:root[data-theme="light"] a { color: #2563eb; }
+
 .output-actions { display: flex; gap: 10px; align-items: center; }
-.ghost {
-  background: transparent;
-  border: 1px solid rgba(255,255,255,0.15);
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
 }
 
 
