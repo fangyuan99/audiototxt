@@ -19,6 +19,7 @@ if ROOT_DIR not in sys.path:
 
 from main import (  # noqa: E402
     transcribe_audio_streaming,
+    transcribe_youtube_url_streaming,
     download_audio_from_youtube,
     download_video_and_extract_audio,
     fetch_douyin_mp3_via_tiksave,
@@ -178,6 +179,8 @@ async def _run_task(
         with _capture_stderr(job_id, loop):
             # Determine audio source
             audio_path: Optional[str] = None
+            file_base_name: Optional[str] = None
+            transcript: str = ""
 
             if source_type == "audio":
                 if uploaded_file is None:
@@ -195,19 +198,31 @@ async def _run_task(
             elif source_type == "youtube":
                 if not youtube_url:
                     raise RuntimeError("缺少 YouTube 链接")
-                await publish(job_id, {"type": "status", "data": "下载 YouTube 音频"})
-                cookies_path: Optional[str] = None
-                if cookies_file is not None:
-                    try:
-                        cookies_bytes = await cookies_file.read()
-                        name = cookies_file.filename or f"cookies_{job_id}.txt"
-                        safe_name = name if name.endswith('.txt') or name.endswith('.cookies') else f"{name}.txt"
-                        cookies_path = os.path.join(DATA_DIR, f"{job_id}_{safe_name}")
-                        with open(cookies_path, 'wb') as cf:
-                            cf.write(cookies_bytes)
-                    except Exception:
-                        cookies_path = None
-                audio_path = await asyncio.to_thread(download_audio_from_youtube, youtube_url, DATA_DIR, "m4a", cookies_path)
+                await publish(job_id, {"type": "status", "data": "开始转写（YouTube 直连）"})
+                # Stream transcript directly from YouTube URL without downloading
+                chunk_cb = _make_chunk_callback(job_id, job)
+                transcript = await asyncio.to_thread(
+                    transcribe_youtube_url_streaming,
+                    api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "",
+                    youtube_url,
+                    model_name,
+                    language_hint,
+                    chunk_cb,
+                )
+                # Derive a filename from YouTube video id
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    parsed = urlparse(youtube_url)
+                    q = parse_qs(parsed.query)
+                    vid = (q.get("v") or [None])[0]
+                    if not vid and parsed.path:
+                        # youtu.be/{id}
+                        parts = [p for p in parsed.path.split("/") if p]
+                        if parts:
+                            vid = parts[-1]
+                    file_base_name = f"youtube_{vid}" if vid else f"youtube_{int(asyncio.get_event_loop().time()*1000):.0f}"
+                except Exception:
+                    file_base_name = f"youtube_{int(asyncio.get_event_loop().time()*1000):.0f}"
 
             elif source_type == "video_url":
                 if not video_url:
@@ -233,24 +248,26 @@ async def _run_task(
             else:
                 raise RuntimeError(f"未知的来源类型：{source_type}")
 
-            if not audio_path or not os.path.isfile(audio_path):
-                raise RuntimeError("音频文件不存在或下载失败")
-
-            await publish(job_id, {"type": "status", "data": "开始转写"})
-
-            # Run transcription with streaming chunks
-            chunk_cb = _make_chunk_callback(job_id, job)
-            transcript = await asyncio.to_thread(
-                transcribe_audio_streaming,
-                api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "",
-                audio_path,
-                model_name,
-                language_hint,
-                chunk_cb,
-            )
+            # For non-YouTube sources we use local audio file transcription
+            if source_type != "youtube":
+                if not audio_path or not os.path.isfile(audio_path):
+                    raise RuntimeError("音频文件不存在或下载失败")
+                await publish(job_id, {"type": "status", "data": "开始转写"})
+                chunk_cb = _make_chunk_callback(job_id, job)
+                transcript = await asyncio.to_thread(
+                    transcribe_audio_streaming,
+                    api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "",
+                    audio_path,
+                    model_name,
+                    language_hint,
+                    chunk_cb,
+                )
 
         # Persist transcript similar to main.py
-        base_name = os.path.splitext(os.path.basename(audio_path))[0]
+        if file_base_name:
+            base_name = file_base_name
+        else:
+            base_name = os.path.splitext(os.path.basename(audio_path))[0]
         out_path = os.path.join(DATA_DIR, base_name + ".txt")
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(transcript)

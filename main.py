@@ -181,6 +181,99 @@ def transcribe_audio_streaming(
     return transcript
 
 
+def transcribe_youtube_url_streaming(
+    api_key: str,
+    youtube_url: str,
+    model_name: str = "gemini-2.5-flash",
+    language_hint: Optional[str] = 'zh',
+    on_chunk=None,
+) -> str:
+    """Use Gemini to transcribe a YouTube URL directly via file_uri with streaming output.
+
+    This avoids downloading the audio locally. Requires google-genai SDK.
+    """
+    # 延迟导入，避免未安装时影响其他路径
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types as genai_types  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "缺少 google-genai 依赖，请先安装：pip install google-genai"
+        ) from e
+
+    client = genai.Client(api_key=api_key)
+
+    language_line = f"主要语言：{language_hint}" if language_hint else "主要语言：按音频原语言"
+    system_instruction_text = (
+        "你是一名专业的听打员，只做逐字转写，不做任何总结、解释或翻译。\n"
+        f"{language_line}。若内容不确定或听不清，请在原位以方括号标注（如：[听不清 00:01:23]、[不确定：人名?]）。\n"
+        "只输出纯文字稿，不要添加标题、前后缀或任何其它说明。"
+    )
+    prompt_text = (
+        "按音频内容逐字转写：\n"
+        "- 仅做最小必要的错别字/口误更正，不改变原意，并进行合理的合并与分段；\n"
+        "- 保留口头语和重复；\n"
+        "- 仅添加基础标点；\n"
+        "- 严禁翻译或补充外部信息；\n"
+        "- 输出为纯文本。"
+    )
+
+    contents = [
+        genai_types.Content(
+            role="user",
+            parts=[
+                genai_types.Part(
+                    file_data=genai_types.FileData(
+                        file_uri=youtube_url,
+                        mime_type="video/*",
+                    )
+                ),
+            ],
+        ),
+        genai_types.Content(role="model", parts=[]),
+        genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=prompt_text)]),
+    ]
+
+    generate_content_config = genai_types.GenerateContentConfig(
+        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+        system_instruction=[genai_types.Part.from_text(text=system_instruction_text)],
+    )
+
+    try:
+        print("开始转写（YouTube 直连）...", file=sys.stderr)
+    except Exception:
+        pass
+
+    full_parts = []
+    emitted_text = ""
+    stream = client.models.generate_content_stream(
+        model=model_name,
+        contents=contents,
+        config=generate_content_config,
+    )
+    for chunk in stream:
+        text_piece = getattr(chunk, "text", None)
+        if text_piece:
+            if emitted_text and text_piece.startswith(emitted_text):
+                delta = text_piece[len(emitted_text):]
+            else:
+                delta = text_piece
+            if delta:
+                if on_chunk:
+                    on_chunk(delta)
+                else:
+                    print(delta, end="", flush=True)
+                full_parts.append(delta)
+                emitted_text += delta
+
+    transcript = "".join(full_parts).strip()
+    try:
+        print(f"转写完成（约 {len(transcript)} 字符）", file=sys.stderr)
+    except Exception:
+        pass
+    return transcript
+
+
 def download_audio_from_youtube(
     youtube_url: str,
     output_dir: str = "./data",
