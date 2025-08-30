@@ -160,6 +160,7 @@ async def _run_task(
     proxy: Optional[str],
     proxy_http: Optional[str],
     proxy_https: Optional[str],
+    cookies_file: Optional[UploadFile] = None,
 ) -> None:
     async with jobs_lock:
         job = jobs.get(job_id)
@@ -195,7 +196,18 @@ async def _run_task(
                 if not youtube_url:
                     raise RuntimeError("缺少 YouTube 链接")
                 await publish(job_id, {"type": "status", "data": "下载 YouTube 音频"})
-                audio_path = await asyncio.to_thread(download_audio_from_youtube, youtube_url, DATA_DIR)
+                cookies_path: Optional[str] = None
+                if cookies_file is not None:
+                    try:
+                        cookies_bytes = await cookies_file.read()
+                        name = cookies_file.filename or f"cookies_{job_id}.txt"
+                        safe_name = name if name.endswith('.txt') or name.endswith('.cookies') else f"{name}.txt"
+                        cookies_path = os.path.join(DATA_DIR, f"{job_id}_{safe_name}")
+                        with open(cookies_path, 'wb') as cf:
+                            cf.write(cookies_bytes)
+                    except Exception:
+                        cookies_path = None
+                audio_path = await asyncio.to_thread(download_audio_from_youtube, youtube_url, DATA_DIR, "m4a", cookies_path)
 
             elif source_type == "video_url":
                 if not video_url:
@@ -277,6 +289,7 @@ async def api_transcribe(
     video_url: Optional[str] = Form(None),
     douyin_text: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
+    cookies_file: Optional[UploadFile] = File(None),
 ):
     job_id = uuid.uuid4().hex
     job = JobState(status="pending", message="")
@@ -298,6 +311,7 @@ async def api_transcribe(
             proxy=proxy,
             proxy_http=proxy_http,
             proxy_https=proxy_https,
+            cookies_file=cookies_file,
         )
     )
 

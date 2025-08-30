@@ -15,10 +15,10 @@
         <div class="field-row">
             <label for="source_type">来源类型</label>
             <select id="source_type" name="source_type">
-                <option value="audio">本地音频文件</option>
-                <option value="youtube">YouTube 链接</option>
-                <option value="video_url">视频直链</option>
+                <!-- <option value="audio">本地音频文件</option> -->
                 <option value="douyin">抖音分享口令/短链</option>
+                <!-- <option value="youtube">YouTube 链接</option> -->
+                <option value="video_url">视频直链</option>
             </select>
         </div>
 
@@ -30,6 +30,10 @@
         <div class="field-row conditional" data-for="youtube">
             <label for="youtube_url">YouTube 链接</label>
             <input type="url" id="youtube_url" name="youtube_url" placeholder="https://www.youtube.com/watch?v=..." />
+        </div>
+        <div class="field-row conditional" data-for="youtube">
+            <label for="cookies_file">Cookies 文件（可选）</label>
+            <input type="file" id="cookies_file" name="cookies_file" accept=".txt,.cookies" />
         </div>
 
         <div class="field-row conditional" data-for="video_url">

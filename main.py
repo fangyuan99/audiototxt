@@ -185,6 +185,7 @@ def download_audio_from_youtube(
     youtube_url: str,
     output_dir: str = "./data",
     preferred_audio_codec: str = "m4a",
+    cookies_path: Optional[str] = None,
 ) -> str:
     """使用 yt-dlp 下载 YouTube 音频并返回本地文件路径。
 
@@ -257,6 +258,9 @@ def download_audio_from_youtube(
 
     try:
         opts = dict(base_opts)
+        if cookies_path:
+            print(f"使用 cookies 文件：{cookies_path}", file=sys.stderr)
+            opts["cookiefile"] = cookies_path
         opts["progress_hooks"] = [_progress_hook]
         opts["postprocessors"] = [
             {
@@ -283,6 +287,9 @@ def download_audio_from_youtube(
 
         try:
             opts = dict(base_opts)
+            if cookies_path:
+                print(f"使用 cookies 文件：{cookies_path}", file=sys.stderr)
+                opts["cookiefile"] = cookies_path
             opts["progress_hooks"] = [_progress_hook]
             opts.pop("postprocessors", None)
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -726,6 +733,11 @@ def main() -> None:
         dest="proxy_https",
         help="仅为 HTTPS 设置代理",
     )
+    parser.add_argument(
+        "--cookies",
+        dest="cookies_path",
+        help="可选，yt-dlp cookies 文件路径（Netscape 格式）。仅对 --youtube 生效",
+    )
 
     args = parser.parse_args()
 
@@ -752,7 +764,11 @@ def main() -> None:
     if getattr(args, "youtube_url", None):
         data_dir = os.path.join(".", "data")
         try:
-            audio_path = download_audio_from_youtube(args.youtube_url, output_dir=data_dir)
+            audio_path = download_audio_from_youtube(
+                args.youtube_url,
+                output_dir=data_dir,
+                cookies_path=getattr(args, "cookies_path", None),
+            )
         except Exception as e:
             print(f"下载音频失败：{e}", file=sys.stderr)
             sys.exit(1)
