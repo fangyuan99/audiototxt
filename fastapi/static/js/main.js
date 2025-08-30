@@ -9,6 +9,20 @@ const copyBtn = document.getElementById('copy-btn');
 const themeToggleBtn = document.getElementById('theme-toggle');
 
 let ws = null;
+let timerIntervalId = null;
+let taskStartTimestampMs = null;
+const originalStartBtnText = startBtn ? startBtn.textContent : '开始转写';
+
+function formatElapsed(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const two = (n) => n.toString().padStart(2, '0');
+  return hours > 0
+    ? `${two(hours)}:${two(minutes)}:${two(seconds)}`
+    : `${two(minutes)}:${two(seconds)}`;
+}
 
 function renderConditionals() {
   const all = document.querySelectorAll('.conditional');
@@ -22,10 +36,16 @@ function renderConditionals() {
 sourceSelect.addEventListener('change', renderConditionals);
 renderConditionals();
 
+function getNowTimeString() {
+  const d = new Date();
+  const two = (n) => n.toString().padStart(2, '0');
+  return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
+}
+
 function appendStatus(text) {
   const div = document.createElement('div');
   div.className = 'status-line';
-  div.textContent = text;
+  div.textContent = `[${getNowTimeString()}] ${text}`;
   statusArea.appendChild(div);
   statusArea.scrollTop = statusArea.scrollHeight;
 }
@@ -43,8 +63,26 @@ function appendOutput(text) {
 }
 
 function setRunning(isRunning) {
+  if (!startBtn || !stopBtn) return;
   startBtn.disabled = isRunning;
   stopBtn.disabled = !isRunning;
+
+  if (isRunning) {
+    taskStartTimestampMs = Date.now();
+    if (timerIntervalId) { try { clearInterval(timerIntervalId); } catch (_) {} }
+    startBtn.textContent = '进行中 00:00';
+    timerIntervalId = setInterval(() => {
+      const elapsed = Date.now() - taskStartTimestampMs;
+      startBtn.textContent = '进行中 ' + formatElapsed(elapsed);
+    }, 1000);
+  } else {
+    if (timerIntervalId) {
+      try { clearInterval(timerIntervalId); } catch (_) {}
+      timerIntervalId = null;
+    }
+    taskStartTimestampMs = null;
+    startBtn.textContent = originalStartBtnText;
+  }
 }
 
 form.addEventListener('submit', async (e) => {
@@ -118,7 +156,12 @@ form.addEventListener('submit', async (e) => {
           appendStatus('错误：' + m.data);
           setRunning(false);
         } else if (m.type === 'done') {
+          // 在清除计时器前计算总用时
+          const elapsedMs = taskStartTimestampMs ? (Date.now() - taskStartTimestampMs) : 0;
           appendStatus('完成');
+          if (elapsedMs > 0) {
+            appendStatus('总用时：' + formatElapsed(elapsedMs));
+          }
           setRunning(false);
           if (m.data && m.data.output_filename) {
             downloadLink.href = '/download/' + encodeURIComponent(m.data.output_filename);
