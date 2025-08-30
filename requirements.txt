@@ -1,0 +1,4 @@
+google-generativeai
+yt-dlp
+requests
+
