@@ -1,0 +1,131 @@
+:root {
+  --bg: #0f1115;
+  --card: #171923;
+  --text: #e6e8ef;
+  --muted: #a2a7b7;
+  --primary: #4f46e5;
+  --accent: #22d3ee;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Noto Sans, "Apple Color Emoji", "Segoe UI Emoji";
+  background: linear-gradient(180deg, #0e0f14, #0b0c10);
+  color: var(--text);
+}
+
+.container {
+  max-width: 960px;
+  margin: 24px auto;
+  padding: 20px 16px 40px;
+}
+
+h1 {
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+form {
+  background: var(--card);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.field-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 0;
+}
+
+label {
+  min-width: 160px;
+  color: var(--muted);
+}
+
+input[type="text"], input[type="url"], input[type="password"], select {
+  flex: 1;
+  padding: 10px 12px;
+  background: #0e1017;
+  border: 1px solid rgba(255,255,255,0.08);
+  color: var(--text);
+  border-radius: 8px;
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+button {
+  appearance: none;
+  border: none;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  color: white;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+button[disabled] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.divider {
+  height: 1px;
+  background: rgba(255,255,255,0.08);
+  margin: 14px 0;
+}
+
+.status-area {
+  background: var(--card);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  padding: 10px 12px;
+  height: 120px;
+  overflow: auto;
+  margin-top: 16px;
+  font-size: 13px;
+}
+
+.status-line { color: var(--muted); }
+
+.output-card {
+  background: var(--card);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  margin-top: 16px;
+}
+
+.output-header {
+  padding: 10px 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+.output {
+  padding: 12px;
+  margin: 0;
+  height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+a { color: #7dd3fc; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.output-actions { display: flex; gap: 10px; align-items: center; }
+.ghost {
+  background: transparent;
+  border: 1px solid rgba(255,255,255,0.15);
+}
+
+

@@ -4,6 +4,8 @@
 
 [English](#english) | [简体中文](#zh) | [Get a gemini key](https://ai.dev/)
 
+👉 [FastAPI（Web UI）](fastapi/README.md)
+
 ---
 
 <a id="english"></a>
