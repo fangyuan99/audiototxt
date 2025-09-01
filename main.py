@@ -205,7 +205,7 @@ def transcribe_youtube_url_streaming(
 
     language_line = f"主要语言：{language_hint}" if language_hint else "主要语言：按音频原语言"
     system_instruction_text = (
-        "你是一名专业的听打员，只做逐字转写，不做任何总结、解释或翻译。\n"
+        "你是一名专业的听打员，只做逐字转写，不做任何总结、解释或翻译，注意分段！注意分段！一段太长不方便阅读。\n"
         f"{language_line}。若内容不确定或听不清，请在原位以方括号标注（如：[听不清 00:01:23]、[不确定：人名?]）。\n"
         "只输出纯文字稿，不要添加标题、前后缀或任何其它说明。"
     )
