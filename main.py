@@ -5,6 +5,24 @@ import time
 import re
 from typing import Optional
 
+SYSTEM_PROMPT = """
+你是一名专业的听打员，只做逐字转写以及进行合理的合并与分段，不做任何总结、解释或翻译.
+严禁所有文字放到一个段落里，要分段。
+主要语言：zh。语言输出。若内容不确定或听不清，请在原位以方括号标注（如：[听不清 00:01:23]、[不确定：人名?]）。
+只输出纯文字稿，不要添加标题、前后缀或任何其它说明。
+"""
+
+CONTENT_PROMPT = """
+按音频内容逐字转写：\n"
+"- 进行合理的分段；\n"
+"- 每一段不要太长，会影响理解；\n"
+"- 仅做最小必要的错别字/口误更正，不改变原意；\n"
+"- 保留口头语和重复；\n"
+"- 仅添加基础标点；\n"
+"- 严禁翻译或补充外部信息；\n"
+"- 输出为纯文本。"
+"""
+
 
 def set_proxies(proxy: Optional[str], proxy_http: Optional[str], proxy_https: Optional[str]) -> None:
     """Configure HTTP(S) proxy via environment variables for the current process.
@@ -102,18 +120,11 @@ def transcribe_audio_streaming(
     # 系统级约束，尽可能强地限制输出风格，避免跑题/扩写/翻译
     language_line = f"主要语言：{language_hint}" if language_hint else "主要语言：按音频原语言"
     system_instruction = (
-        "你是一名专业的听打员，只做逐字转写以及进行合理的合并与分段，不做任何总结、解释或翻译。\n"
-        f"{language_line}语言输出。若内容不确定或听不清，请在原位以方括号标注（如：[听不清 00:01:23]、[不确定：人名?]）。\n"
-        "只输出纯文字稿，不要添加标题、前后缀或任何其它说明。"
+        SYSTEM_PROMPT
     )
 
     prompt = (
-        "按音频内容逐字转写：\n"
-        "- 仅做最小必要的错别字/口误更正，不改变原意；\n"
-        "- 保留口头语和重复；\n"
-        "- 仅添加基础标点；\n"
-        "- 严禁翻译或补充外部信息；\n"
-        "- 输出为纯文本。"
+        CONTENT_PROMPT
     )
 
     generation_config = {
@@ -205,19 +216,10 @@ def transcribe_youtube_url_streaming(
 
     language_line = f"主要语言：{language_hint}" if language_hint else "主要语言：按音频原语言"
     system_instruction_text = (
-        "你是一名专业的听打员，只做逐字转写，不做任何总结、解释或翻译，注意分段！注意分段！一段太长不方便阅读。\n"
-        f"{language_line}。若内容不确定或听不清，请在原位以方括号标注（如：[听不清 00:01:23]、[不确定：人名?]）。\n"
-        "只输出纯文字稿，不要添加标题、前后缀或任何其它说明。"
-        "严禁所有文字放到一个段落里，要分段。"
+        SYSTEM_PROMPT
     )
     prompt_text = (
-        "按音频内容逐字转写：\n"
-        "- 仅做最小必要的错别字/口误更正，不改变原意，并进行合理的分段；\n"
-        "- 每一段不要太长，会影响理解；\n"
-        "- 保留口头语和重复；\n"
-        "- 仅添加基础标点；\n"
-        "- 严禁翻译或补充外部信息；\n"
-        "- 输出为纯文本。"
+        CONTENT_PROMPT
     )
 
     contents = [
