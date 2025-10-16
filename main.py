@@ -3,6 +3,8 @@ import os
 import sys
 import time
 import re
+import threading
+import glob
 from typing import Optional
 
 SYSTEM_PROMPT = """
@@ -52,7 +54,7 @@ def ensure_package() -> None:
             "未检测到 google-generativeai 包。请先安装依赖：\n"
             "  pip install -r requirements.txt\n"
             "或：\n"
-            "  pip install google-generativeai>=0.7.2,<1.0.0",
+            "  pip install google-generativeai",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -99,9 +101,11 @@ def transcribe_audio_streaming(
     on_chunk=None,
 ) -> str:
     """Use Gemini to transcribe an audio file into text with streaming output.
-
+    
+    Uses Base64 encoding to avoid the ragStoreName error with upload_file.
     Returns the full transcript while yielding chunks via on_chunk or stdout.
     """
+    import base64
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
@@ -109,45 +113,68 @@ def transcribe_audio_streaming(
     if not os.path.isfile(audio_path):
         raise FileNotFoundError(f"找不到音频文件：{audio_path}")
 
-    # Upload the audio to the File API for reliable handling of larger files
+    # 读取音频文件并进行 Base64 编码
     try:
-        print(f"上传音频：{os.path.basename(audio_path)}", file=sys.stderr)
-    except Exception:
-        pass
-    uploaded_file = genai.upload_file(audio_path)
-    wait_for_file_active(genai, uploaded_file)
+        print(f"读取音频：{os.path.basename(audio_path)}", file=sys.stderr)
+        with open(audio_path, 'rb') as audio_file:
+            audio_data = audio_file.read()
+        
+        # Base64 编码
+        encoded_string = base64.b64encode(audio_data).decode('utf-8')
+        
+        # 检测音频文件类型
+        file_ext = os.path.splitext(audio_path)[1].lower()
+        mime_type_map = {
+            '.mp3': 'audio/mp3',
+            '.m4a': 'audio/mp4',
+            '.wav': 'audio/wav',
+            '.flac': 'audio/flac',
+            '.ogg': 'audio/ogg',
+            '.aac': 'audio/aac',
+            '.opus': 'audio/opus'
+        }
+        mime_type = mime_type_map.get(file_ext, 'audio/mp3')  # 默认为 mp3
+        
+    except Exception as e:
+        raise RuntimeError(f"无法读取音频文件: {str(e)}") from e
 
     # 系统级约束，尽可能强地限制输出风格，避免跑题/扩写/翻译
     language_line = f"主要语言：{language_hint}" if language_hint else "主要语言：按音频原语言"
-    system_instruction = (
-        SYSTEM_PROMPT
-    )
-
-    prompt = (
-        CONTENT_PROMPT
-    )
+    
+    # 将系统指令和内容提示合并为完整的提示文本
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{CONTENT_PROMPT}"
+    if language_hint:
+        full_prompt += f"\n{language_line}"
 
     generation_config = {
         "temperature": 0.0,
         "top_p": 0.9,
         "top_k": 40,
-        "response_mime_type": "text/plain",
     }
 
+    # 兼容旧版本，不使用 system_instruction 参数
     model = genai.GenerativeModel(
         model_name,
-        system_instruction=system_instruction,
         generation_config=generation_config,
     )
 
-    # 注意顺序：先给指令，再给音频
+    # 构建内容数据，使用 Base64 编码避免 ragStoreName 错误
+    content_data = {
+        "inline_data": {
+            "mime_type": mime_type,
+            "data": encoded_string
+        }
+    }
+
     try:
         print("开始转写...", file=sys.stderr)
     except Exception:
         pass
+    
+    # 使用 Base64 编码的音频数据进行流式生成
     response_stream = model.generate_content([
-        prompt,
-        uploaded_file,
+        content_data,
+        full_prompt,
     ], stream=True)
 
     # 增量去重：规避某些实现中分片重复回放导致的重复内容
@@ -199,83 +226,27 @@ def transcribe_youtube_url_streaming(
     language_hint: Optional[str] = 'zh',
     on_chunk=None,
 ) -> str:
-    """Use Gemini to transcribe a YouTube URL directly via file_uri with streaming output.
+    """Use Gemini to transcribe a YouTube URL by downloading and processing locally.
 
-    This avoids downloading the audio locally. Requires google-genai SDK.
+    This downloads the audio locally first, then uses the standard audio transcription.
     """
-    # 延迟导入，避免未安装时影响其他路径
+    import tempfile
+
+    # 下载 YouTube 音频到临时文件
     try:
-        from google import genai  # type: ignore
-        from google.genai import types as genai_types  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "缺少 google-genai 依赖，请先安装：pip install google-genai"
-        ) from e
-
-    client = genai.Client(api_key=api_key)
-
-    language_line = f"主要语言：{language_hint}" if language_hint else "主要语言：按音频原语言"
-    system_instruction_text = (
-        SYSTEM_PROMPT
-    )
-    prompt_text = (
-        CONTENT_PROMPT
-    )
-
-    contents = [
-        genai_types.Content(
-            role="user",
-            parts=[
-                genai_types.Part(
-                    file_data=genai_types.FileData(
-                        file_uri=youtube_url,
-                        mime_type="video/*",
-                    )
-                ),
-            ],
-        ),
-        genai_types.Content(role="model", parts=[]),
-        genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=prompt_text)]),
-    ]
-
-    generate_content_config = genai_types.GenerateContentConfig(
-        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-        system_instruction=[genai_types.Part.from_text(text=system_instruction_text)],
-    )
-
-    try:
-        print("开始转写（YouTube 直连）...", file=sys.stderr)
-    except Exception:
-        pass
-
-    full_parts = []
-    emitted_text = ""
-    stream = client.models.generate_content_stream(
-        model=model_name,
-        contents=contents,
-        config=generate_content_config,
-    )
-    for chunk in stream:
-        text_piece = getattr(chunk, "text", None)
-        if text_piece:
-            if emitted_text and text_piece.startswith(emitted_text):
-                delta = text_piece[len(emitted_text):]
-            else:
-                delta = text_piece
-            if delta:
-                if on_chunk:
-                    on_chunk(delta)
-                else:
-                    print(delta, end="", flush=True)
-                full_parts.append(delta)
-                emitted_text += delta
-
-    transcript = "".join(full_parts).strip()
-    try:
-        print(f"转写完成（约 {len(transcript)} 字符）", file=sys.stderr)
-    except Exception:
-        pass
-    return transcript
+        print("下载 YouTube 音频...", file=sys.stderr)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = download_audio_from_youtube(youtube_url, temp_dir)
+            # 使用标准的音频转写函数
+            return transcribe_audio_streaming(
+                api_key=api_key,
+                audio_path=audio_path,
+                model_name=model_name,
+                language_hint=language_hint,
+                on_chunk=on_chunk
+            )
+    except Exception as e:
+        raise RuntimeError(f"YouTube 音频转写失败: {str(e)}") from e
 
 
 def download_audio_from_youtube(
@@ -561,6 +532,70 @@ def _get_system_proxies() -> dict:
     return proxies
 
 
+def cleanup_old_files(data_dir: str = "./data", max_age_hours: float = 24.0) -> None:
+    """清理指定目录中超过指定时间的文件
+    
+    Args:
+        data_dir: 要清理的目录路径
+        max_age_hours: 文件最大保留时间（小时）
+    """
+    if not os.path.exists(data_dir):
+        return
+    
+    current_time = time.time()
+    max_age_seconds = max_age_hours * 3600
+    
+    try:
+        # 获取目录中的所有文件
+        pattern = os.path.join(data_dir, "*")
+        files = glob.glob(pattern)
+        
+        cleaned_count = 0
+        for file_path in files:
+            if os.path.isfile(file_path):
+                try:
+                    # 获取文件修改时间
+                    file_mtime = os.path.getmtime(file_path)
+                    file_age = current_time - file_mtime
+                    
+                    # 如果文件超过指定时间，则删除
+                    if file_age > max_age_seconds:
+                        os.remove(file_path)
+                        cleaned_count += 1
+                        print(f"已清理过期文件: {os.path.basename(file_path)}", file=sys.stderr)
+                except Exception as e:
+                    print(f"清理文件失败 {file_path}: {e}", file=sys.stderr)
+        
+        if cleaned_count > 0:
+            print(f"清理完成，共删除 {cleaned_count} 个过期文件", file=sys.stderr)
+        
+    except Exception as e:
+        print(f"清理目录失败: {e}", file=sys.stderr)
+
+
+def start_cleanup_timer(data_dir: str = "./data", cleanup_hours: float = 24.0) -> None:
+    """启动定时清理任务
+    
+    Args:
+        data_dir: 要清理的目录路径
+        cleanup_hours: 清理间隔时间（小时）
+    """
+    def cleanup_task():
+        while True:
+            try:
+                # 等待指定时间
+                time.sleep(cleanup_hours * 3600)
+                # 执行清理
+                cleanup_old_files(data_dir, cleanup_hours)
+            except Exception as e:
+                print(f"定时清理任务异常: {e}", file=sys.stderr)
+    
+    # 启动后台线程执行清理任务
+    cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
+    cleanup_thread.start()
+    print(f"已启动定时清理任务，每 {cleanup_hours} 小时清理一次 {data_dir} 目录", file=sys.stderr)
+
+
 def _extract_first_url(text: str) -> Optional[str]:
     """从任意文本中提取第一个 URL。优先返回包含 v.douyin.com 的链接。"""
     if not text:
@@ -835,6 +870,13 @@ def main() -> None:
         dest="cookies_path",
         help="可选，yt-dlp cookies 文件路径（Netscape 格式）。仅对 --youtube 生效",
     )
+    parser.add_argument(
+        "--cleanup-hours",
+        dest="cleanup_hours",
+        type=float,
+        default=24.0,
+        help="data文件夹自动清理间隔时间（小时），默认24小时。设置为0禁用自动清理",
+    )
 
     args = parser.parse_args()
 
@@ -843,6 +885,12 @@ def main() -> None:
 
     # Configure proxies if provided
     set_proxies(args.proxy, args.proxy_http, args.proxy_https)
+
+    # 启动定时清理任务（如果启用）
+    if args.cleanup_hours > 0:
+        data_dir = os.path.join(".", "data")
+        os.makedirs(data_dir, exist_ok=True)
+        start_cleanup_timer(data_dir, args.cleanup_hours)
 
     # Resolve API key precedence: CLI > GOOGLE_API_KEY > GEMINI_API_KEY
     api_key = (

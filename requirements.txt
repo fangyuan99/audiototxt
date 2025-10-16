@@ -1,5 +1,4 @@
 google-generativeai
-google-genai
 yt-dlp
 requests
 fastapi>=0.110.0

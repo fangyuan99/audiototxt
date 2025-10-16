@@ -3,6 +3,7 @@ import sys
 import uuid
 import asyncio
 import io
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Callable
 
@@ -25,12 +26,16 @@ from main import (  # noqa: E402
     fetch_douyin_mp3_via_tiksave,
     download_audio_from_direct_url,
     set_proxies,
+    cleanup_old_files,
+    start_cleanup_timer,
 )
 
 
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# 默认清理间隔24小时
+DEFAULT_CLEANUP_HOURS = 24.0
 
 app = FastAPI(title="AudioToTxt UI")
 
@@ -51,6 +56,16 @@ class JobState:
 
 jobs: Dict[str, JobState] = {}
 jobs_lock = asyncio.Lock()
+
+
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时的初始化任务"""
+    # 启动定时清理任务
+    cleanup_hours = float(os.getenv("CLEANUP_HOURS", DEFAULT_CLEANUP_HOURS))
+    if cleanup_hours > 0:
+        start_cleanup_timer(DATA_DIR, cleanup_hours)
+        print(f"FastAPI: 已启动定时清理任务，每 {cleanup_hours} 小时清理一次", file=sys.stderr)
 
 
 async def publish(job_id: str, event: Dict[str, Any]) -> None:
@@ -377,5 +392,47 @@ async def download_result(filename: str):
     if not os.path.isfile(path):
         return JSONResponse({"error": "文件不存在"}, status_code=404)
     return FileResponse(path, filename=filename, media_type="text/plain; charset=utf-8")
+
+
+@app.post("/api/cleanup")
+async def api_cleanup(max_age_hours: Optional[float] = None):
+    """手动清理data目录中的过期文件"""
+    try:
+        age_hours = max_age_hours or DEFAULT_CLEANUP_HOURS
+        cleanup_old_files(DATA_DIR, age_hours)
+        return JSONResponse({"status": "success", "message": f"已清理超过 {age_hours} 小时的文件"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.get("/api/files")
+async def api_list_files():
+    """列出data目录中的文件"""
+    try:
+        import glob
+        pattern = os.path.join(DATA_DIR, "*")
+        files = glob.glob(pattern)
+        
+        file_list = []
+        for file_path in files:
+            if os.path.isfile(file_path):
+                stat = os.stat(file_path)
+                file_list.append({
+                    "name": os.path.basename(file_path),
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                    "age_hours": (time.time() - stat.st_mtime) / 3600
+                })
+        
+        # 按修改时间排序，最新的在前
+        file_list.sort(key=lambda x: x["modified"], reverse=True)
+        
+        return JSONResponse({
+            "status": "success", 
+            "files": file_list,
+            "total_count": len(file_list)
+        })
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
