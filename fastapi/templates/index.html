@@ -1,110 +1,199 @@
 <!DOCTYPE html>
 <html lang="zh-CN" data-theme="light">
-<head>
+  <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AudioToTxt 可视化</title>
     <link rel="stylesheet" href="/static/css/style.css" />
-</head>
-<body>
-<div class="container">
-    <div class="topbar">
+  </head>
+  <body>
+    <div class="container">
+      <div class="topbar">
         <h1>AudioToTxt</h1>
         <div>
-            <button type="button" id="theme-toggle" class="actions">浅色主题</button>
+          <button type="button" id="theme-toggle" class="actions">
+            浅色主题
+          </button>
         </div>
-    </div>
-    <p>选择来源并开始转写。转写过程中的文本会实时显示。</p>
+      </div>
+      <p>选择来源并开始转写。转写过程中的文本会实时显示。</p>
 
-    <form id="task-form">
+      <form id="task-form">
         <div class="field-row">
-            <label for="source_type">来源类型</label>
-            <select id="source_type" name="source_type">
-                <!-- <option value="audio">本地音频文件</option> -->
-                <option value="douyin">抖音分享口令/短链</option>
-                <option value="youtube">YouTube 链接</option>
-                <option value="video_url">视频直链</option>
-            </select>
+          <label for="source_type">来源类型</label>
+          <select id="source_type" name="source_type">
+            <!-- <option value="audio">本地音频文件</option> -->
+            <option value="douyin">抖音分享口令/短链</option>
+            <option value="youtube">YouTube 链接</option>
+            <option value="video_url">视频直链</option>
+          </select>
         </div>
 
         <div class="field-row conditional" data-for="audio">
-            <label for="file">音频文件</label>
-            <input type="file" id="file" name="file" accept="audio/*" />
+          <label for="file">音频文件</label>
+          <input type="file" id="file" name="file" accept="audio/*" />
         </div>
 
         <div class="field-row conditional" data-for="youtube">
-            <label for="youtube_url">YouTube 链接</label>
-            <input type="url" id="youtube_url" name="youtube_url" placeholder="https://www.youtube.com/watch?v=..." />
+          <label for="youtube_url">YouTube 链接</label>
+          <div style="display: flex; gap: 8px; flex: 1">
+            <input
+              type="url"
+              id="youtube_url"
+              name="youtube_url"
+              placeholder="https://www.youtube.com/watch?v=..."
+              style="flex: 1"
+            />
+            <button
+              type="button"
+              id="paste-youtube"
+              class="paste-btn"
+              title="粘贴链接"
+            >
+              📋
+            </button>
+          </div>
         </div>
         <div class="field-row conditional" data-for="youtube">
-            <label for="cookies_file">Cookies 文件（可选）</label>
-            <input type="file" id="cookies_file" name="cookies_file" accept=".txt,.cookies" />
+          <label for="cookies_file">Cookies 文件（可选）</label>
+          <input
+            type="file"
+            id="cookies_file"
+            name="cookies_file"
+            accept=".txt,.cookies"
+          />
         </div>
 
         <div class="field-row conditional" data-for="video_url">
-            <label for="video_url">视频直链</label>
-            <input type="url" id="video_url" name="video_url" placeholder="https://example.com/video.mp4" />
+          <label for="video_url">视频直链</label>
+          <div style="display: flex; gap: 8px; flex: 1">
+            <input
+              type="url"
+              id="video_url"
+              name="video_url"
+              placeholder="https://example.com/video.mp4"
+              style="flex: 1"
+            />
+            <button
+              type="button"
+              id="paste-video"
+              class="paste-btn"
+              title="粘贴链接"
+            >
+              📋
+            </button>
+          </div>
         </div>
 
         <div class="field-row conditional" data-for="douyin">
-            <label for="douyin_text">抖音分享口令或短链</label>
-            <input type="text" id="douyin_text" name="douyin_text" placeholder="粘贴抖音分享内容或短链" />
+          <label for="douyin_text">抖音分享口令或短链</label>
+          <div style="display: flex; gap: 8px; flex: 1">
+            <input
+              type="text"
+              id="douyin_text"
+              name="douyin_text"
+              placeholder="粘贴抖音分享内容或短链"
+              style="flex: 1"
+            />
+            <button
+              type="button"
+              id="paste-douyin"
+              class="paste-btn"
+              title="粘贴链接"
+            >
+              📋
+            </button>
+          </div>
         </div>
 
         <div class="divider"></div>
 
         <div class="field-row">
-            <label for="api_key">Gemini API Key</label>
-            <input type="password" id="api_key" name="api_key" placeholder="未填写则读取环境变量" />
+          <label for="api_key">Gemini API Key</label>
+          <input
+            type="password"
+            id="api_key"
+            name="api_key"
+            placeholder="未填写则读取环境变量"
+          />
         </div>
 
         <div class="field-row">
-            <label for="model_name">模型</label>
-            <input type="text" id="model_name" name="model_name" value="gemini-2.5-flash" />
+          <label for="model_name">模型</label>
+          <input
+            type="text"
+            id="model_name"
+            name="model_name"
+            value="gemini-2.5-flash"
+          />
         </div>
 
         <div class="field-row">
-            <label for="language_hint">语言提示</label>
-            <input type="text" id="language_hint" name="language_hint" placeholder="如 zh / en / ja（可空）" />
+          <label for="language_hint">语言提示</label>
+          <input
+            type="text"
+            id="language_hint"
+            name="language_hint"
+            placeholder="如 zh / en / ja（可空）"
+          />
         </div>
 
         <div class="field-row">
-            <label for="proxy">代理（统一）</label>
-            <input type="text" id="proxy" name="proxy" placeholder="http://127.0.0.1:7890（可空）" />
+          <label for="proxy">代理（统一）</label>
+          <input
+            type="text"
+            id="proxy"
+            name="proxy"
+            placeholder="http://127.0.0.1:7890（可空）"
+          />
         </div>
         <div class="field-row">
-            <label for="proxy_http">HTTP 代理</label>
-            <input type="text" id="proxy_http" name="proxy_http" placeholder="可空" />
+          <label for="proxy_http">HTTP 代理</label>
+          <input
+            type="text"
+            id="proxy_http"
+            name="proxy_http"
+            placeholder="可空"
+          />
         </div>
         <div class="field-row">
-            <label for="proxy_https">HTTPS 代理</label>
-            <input type="text" id="proxy_https" name="proxy_https" placeholder="可空" />
+          <label for="proxy_https">HTTPS 代理</label>
+          <input
+            type="text"
+            id="proxy_https"
+            name="proxy_https"
+            placeholder="可空"
+          />
         </div>
 
         <div class="actions">
-            <button type="submit" id="start-btn">开始转写</button>
-            <button type="button" id="stop-btn" disabled>停止（关闭页面即可断开展示）</button>
+          <button type="submit" id="start-btn">开始转写</button>
+          <button type="button" id="stop-btn" disabled>
+            停止（关闭页面即可断开展示）
+          </button>
         </div>
-    </form>
+      </form>
 
-    <div id="status-area" class="status-area">
+      <div id="status-area" class="status-area">
         <div class="status-line">等待开始...</div>
-    </div>
+      </div>
 
-    <div class="output-card">
+      <div class="output-card">
         <div class="output-header">
-            <span>实时转写</span>
-            <div class="output-actions">
-                <button type="button" id="copy-btn" class="actions">复制全文</button>
-                <a id="download-link" style="display:none" target="_blank">下载完整文本</a>
-            </div>
+          <span>实时转写</span>
+          <div class="output-actions">
+            <button type="button" id="copy-btn" class="actions">
+              复制全文
+            </button>
+            <a id="download-link" style="display: none" target="_blank"
+              >下载完整文本</a
+            >
+          </div>
         </div>
         <pre id="output" class="output"></pre>
+      </div>
     </div>
-</div>
 
-<script src="/static/js/main.js"></script>
-</body>
+    <script src="/static/js/main.js"></script>
+  </body>
 </html>
-
-

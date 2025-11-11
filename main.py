@@ -372,6 +372,7 @@ def download_video_and_extract_audio(
     preferred_audio_codec: str = "m4a",
 ) -> str:
     """从视频直链下载视频，使用ffmpeg提取音频并返回本地音频文件路径。
+    如果文件本身就是音频格式，则跳过音频提取步骤。
     
     Args:
         video_url: 视频直链URL
@@ -391,6 +392,9 @@ def download_video_and_extract_audio(
     
     os.makedirs(output_dir, exist_ok=True)
     
+    # 支持的音频格式列表
+    AUDIO_EXTENSIONS = {'.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac', '.opus', '.wma'}
+    
     # 从URL中提取文件名，如果没有则使用时间戳
     parsed_url = urlparse(video_url)
     url_path = parsed_url.path
@@ -404,15 +408,26 @@ def download_video_and_extract_audio(
         name = f"video_{int(time.time())}"
         ext = ".mp4"  # 默认扩展名
     
+    # 检查是否是音频文件
+    is_audio_file = ext.lower() in AUDIO_EXTENSIONS
+    
     # 临时视频文件路径
     temp_video_path = os.path.join(output_dir, f"{name}_temp{ext}")
     # 最终音频文件路径
-    audio_path = os.path.join(output_dir, f"{name}.{preferred_audio_codec}")
+    if is_audio_file:
+        # 如果是音频文件，直接使用原始扩展名
+        audio_path = os.path.join(output_dir, f"{name}{ext}")
+    else:
+        # 如果是视频文件，使用指定的音频编码
+        audio_path = os.path.join(output_dir, f"{name}.{preferred_audio_codec}")
     
     try:
-        print(f"开始下载视频：{video_url}", file=sys.stderr)
+        if is_audio_file:
+            print(f"开始下载音频文件：{video_url}", file=sys.stderr)
+        else:
+            print(f"开始下载视频文件：{video_url}", file=sys.stderr)
         
-        # 下载视频文件
+        # 下载文件
         # 获取系统代理设置
         proxies = _get_system_proxies()
         response = requests.get(video_url, stream=True, proxies=proxies if proxies else None)
@@ -422,7 +437,10 @@ def download_video_and_extract_audio(
         downloaded_size = 0
         last_pct = -5
         
-        with open(temp_video_path, 'wb') as f:
+        # 如果是音频文件，直接下载到最终路径；否则下载到临时路径
+        download_path = audio_path if is_audio_file else temp_video_path
+        
+        with open(download_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
@@ -435,9 +453,13 @@ def download_video_and_extract_audio(
                             last_pct = pct
                             print(f"下载进度：{pct}%", file=sys.stderr)
         
+        # 如果是音频文件，跳过转换步骤
+        if is_audio_file:
+            print("音频文件下载完成，跳过格式转换", file=sys.stderr)
+            return audio_path
+        
         print("视频下载完成，开始提取音频...", file=sys.stderr)
         
-        # 使用ffmpeg提取音频
         # 使用ffmpeg提取音频
         ffmpeg_codec = _get_ffmpeg_audio_codec(preferred_audio_codec)
         ffmpeg_cmd = [
@@ -485,16 +507,17 @@ def download_video_and_extract_audio(
         return audio_path
         
     except requests.RequestException as e:
-        raise RuntimeError(f"下载视频失败：{e}")
+        raise RuntimeError(f"下载文件失败：{e}")
     except Exception as e:
-        raise RuntimeError(f"处理视频失败：{e}")
+        raise RuntimeError(f"处理文件失败：{e}")
     finally:
-        # 清理临时视频文件
-        try:
-            if os.path.exists(temp_video_path):
-                os.remove(temp_video_path)
-        except Exception:
-            pass
+        # 只有视频文件才需要清理临时文件，音频文件不需要
+        if not is_audio_file:
+            try:
+                if os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+            except Exception:
+                pass
 
 
 def _get_ffmpeg_audio_codec(codec_name: str) -> str:
