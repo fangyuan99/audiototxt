@@ -1,0 +1,10 @@
+data/
+.git
+.gitignore
+*.md
+__pycache__
+.pytest_cache
+.env.local
+.env.*.local
+node_modules
+
