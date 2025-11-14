@@ -13,10 +13,6 @@
   ],
   "routes": [
     {
-      "src": "/static/(.*)",
-      "dest": "/fastapi/static/$1"
-    },
-    {
       "src": "/(.*)",
       "dest": "api/index.py"
     }
