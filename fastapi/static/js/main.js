@@ -29,9 +29,15 @@ function renderConditionals() {
   const selected = sourceSelect.value;
   all.forEach((el) => {
     const forType = el.getAttribute("data-for");
-    el.style.display = forType === selected ? "flex" : "none";
+    // 默认隐藏，匹配时显示
+    el.style.display = forType === selected ? "" : "none";
   });
 }
+
+// 初始化时隐藏所有 conditional 元素
+document.querySelectorAll(".conditional").forEach((el) => {
+  el.style.display = "none";
+});
 
 sourceSelect.addEventListener("change", renderConditionals);
 renderConditionals();
@@ -43,10 +49,10 @@ function getNowTimeString() {
 }
 
 function appendStatus(text) {
-  const div = document.createElement("div");
-  div.className = "status-line";
-  div.textContent = `[${getNowTimeString()}] ${text}`;
-  statusArea.appendChild(div);
+  const p = document.createElement("p");
+  p.textContent = `[${getNowTimeString()}] ${text}`;
+  p.style.margin = "0.25rem 0";
+  statusArea.appendChild(p);
   statusArea.scrollTop = statusArea.scrollHeight;
 }
 
@@ -56,7 +62,7 @@ function appendOutput(text) {
   // 若上一次末尾非空且当前片段以换行开头，保持原样
   // 仅在出现段落断句（\n\n 或 \r\n\r\n）时确保两个换行
   const normalized = text.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n");
-  outputPre.textContent += normalized;
+  outputPre.value += normalized;
   outputPre.scrollTop = outputPre.scrollHeight;
 }
 
@@ -97,7 +103,7 @@ form.addEventListener("submit", async (e) => {
     } catch (e) {}
     ws = null;
   }
-  outputPre.textContent = "";
+  outputPre.value = "";
   statusArea.innerHTML = "";
   downloadLink.style.display = "none";
   downloadLink.removeAttribute("href");
@@ -206,7 +212,7 @@ form.addEventListener("submit", async (e) => {
 // Copy full transcript
 copyBtn?.addEventListener("click", async () => {
   try {
-    const text = outputPre.textContent || "";
+    const text = outputPre.value || "";
     if (!text) return;
     await navigator.clipboard.writeText(text);
     appendStatus("已复制全文");
@@ -289,18 +295,19 @@ function applyTheme(theme) {
   const root = document.documentElement;
   if (theme === "light") {
     root.setAttribute("data-theme", "light");
-    themeToggleBtn && (themeToggleBtn.textContent = "深色主题");
+    themeToggleBtn && (themeToggleBtn.textContent = "🌙 深色主题");
   } else {
-    root.removeAttribute("data-theme");
-    themeToggleBtn && (themeToggleBtn.textContent = "浅色主题");
+    root.setAttribute("data-theme", "dark");
+    themeToggleBtn && (themeToggleBtn.textContent = "☀️ 浅色主题");
   }
 }
 function initTheme() {
   try {
     const saved = localStorage.getItem(THEME_KEY);
-    applyTheme(saved === "light" ? "light" : "dark");
+    // Default to light theme for better readability
+    applyTheme(saved === "dark" ? "dark" : "light");
   } catch (_) {
-    applyTheme("dark");
+    applyTheme("light");
   }
 }
 themeToggleBtn?.addEventListener("click", () => {
