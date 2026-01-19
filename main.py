@@ -702,77 +702,69 @@ def fetch_douyin_audio_url(aweme_id: str) -> str:
 
 
 def fetch_douyin_mp3_via_tiksave(share_text: str):
-    """调用 tiksave 接口，解析返回 HTML，提取 MP3 直链及元信息。
+    """调用 downcats 接口，提取抖音音频直链及元信息。
 
     Returns:
         (mp3_url, title, tiktok_id)
     """
     import requests
-    import html as html_lib
+    import json
 
-    url = "https://tiksave.io/api/ajaxSearch"
+    url = "https://www.downcats.com/v1/extract/free/video"
     proxies = _get_system_proxies()
 
     headers = {
-        "x-requested-with": "XMLHttpRequest",
-        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "accept": "*/*",
-        "user-agent": (
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+        "Origin": "https://www.downcats.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
+            "Chrome/134.0.0.0 Safari/537.36"
         ),
-        "connection": "keep-alive",
     }
-    data = {
-        "q": share_text,
-        "lang": "zh-cn",
+    
+    payload = {
+        "text": share_text,
+        "locale": "zh"
     }
 
     try:
-        print("请求 tiksave 接口...", file=sys.stderr)
-        resp = requests.post(url, headers=headers, data=data, timeout=30, proxies=proxies if proxies else None)
+        print("请求 downcats 接口...", file=sys.stderr)
+        resp = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=30,
+            proxies=proxies if proxies else None
+        )
         resp.raise_for_status()
         j = resp.json()
     except Exception as e:
-        raise RuntimeError(f"tiksave 接口请求失败：{e}")
+        raise RuntimeError(f"downcats 接口请求失败：{e}")
 
-    if not isinstance(j, dict) or j.get("status") != "ok":
-        raise RuntimeError(f"tiksave 返回异常：{j}")
+    if not isinstance(j, dict) or j.get("code") != "OK":
+        raise RuntimeError(f"downcats 返回异常：{j}")
 
-    html = j.get("data") or ""
-    if not html:
-        raise RuntimeError("tiksave 未返回有效 HTML 内容")
+    data = j.get("data") or {}
+    if not data:
+        raise RuntimeError("downcats 未返回有效数据")
 
-    # 解析 MP3 链接
-    # 形如：<a ... href="https://dl.snapcdn.app/get?..." ...> 下载 MP3
-    # print(html)
-    pattern = r'https://dl\.snapcdn\.app/get\?token=.*?MP3'
+    # 提取音频链接
+    mp3_url = data.get("music")
+    if not mp3_url:
+        raise RuntimeError("downcats 未返回音频链接")
 
-    mp3_match = re.search(pattern, html, re.IGNORECASE)
-    if not mp3_match:
-        # 容错：有时按钮文本包含 &nbsp; 或其他空白
-        mp3_match = re.search(pattern, html, re.IGNORECASE)
-    if not mp3_match:
-        raise RuntimeError("未能在 tiksave HTML 中找到 MP3 下载链接")
-    mp3_url = mp3_match[0].split('"')[0]
+    # 提取标题
+    title = data.get("text", "").strip() if data.get("text") else None
 
-    # 可选：标题与 TikTokId，用于命名
-    title = None
-    try:
-        t = re.search(r"<h3>([\s\S]*?)</h3>", html)
-        if t:
-            title = html_lib.unescape(t.group(1)).strip()
-    except Exception:
-        title = None
-
+    # 暂无 tiktok_id，设为 None
     tiktok_id = None
-    try:
-        tid = re.search(r'id="TikTokId"\s+value="(\d+)"', html)
-        if tid:
-            tiktok_id = tid.group(1)
-    except Exception:
-        tiktok_id = None
 
     return mp3_url, title, tiktok_id
 

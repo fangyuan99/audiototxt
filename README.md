@@ -72,7 +72,7 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
   ```bash
   python main.py --douyin "复制这条口令 https://v.douyin.com/xlaEmh_fVPg/ 打开Dou音..." --lang en --api-key YOUR_KEY
   ```
-  - The program posts to `https://tiksave.io/api/ajaxSearch` with your share text, parses returned HTML for the “Download MP3” link (e.g. `https://dl.snapcdn.app/get?...`), downloads MP3 as `./data/douyin_{TikTokId}.mp3` (or timestamped if missing), then transcribes.
+  - The program posts to `downcats.com` with your share text, parses returned HTML for the “Download MP3” link, downloads MP3 as `./data/douyin_{TikTokId}.mp3` (or timestamped if missing), then transcribes.
 
 - Proxy:
   ```bash
@@ -200,7 +200,7 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
   ```bash
   python main.py --douyin "0.25 aNJ:/ ... https://v.douyin.com/xlaEmh_fVPg/ 复制此链接，打开Dou音搜索，直接观看视频！" --lang zh --api-key YOUR_KEY
   ```
-  - 程序会向 `https://tiksave.io/api/ajaxSearch` 提交你的分享文案/短链，解析返回的 HTML，提取“下载 MP3”按钮的直链（如 `https://dl.snapcdn.app/get?...`），将音频保存为 `./data/douyin_{TikTokId}.mp3`（若缺失则用时间戳），随后进行转写。
+  - 程序会向 `downcats.com` 提交你的分享文案/短链，解析返回的 HTML，提取“下载 MP3”按钮的直链，将音频保存为 `./data/douyin_{TikTokId}.mp3`（若缺失则用时间戳），随后进行转写。
 
 - 使用代理（如本地 HTTP 代理 127.0.0.1:7890）：
   ```bash

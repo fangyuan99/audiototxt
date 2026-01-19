@@ -42,7 +42,7 @@ python fastapi/run.py
 - 必需：`fastapi`、`uvicorn`、`python-multipart`、`jinja2`
 - 已与 `pydantic`、`starlette` 版本匹配（见根目录 `requirements.txt`）
 - 建议安装：`ffmpeg`（用于视频直链抽取音频）
-- 抖音路径依赖第三方 `tiksave.io`，其可用性受外部网络与站点变化影响
+- 抖音路径依赖第三方 `downcats.com`，其可用性受外部网络与站点变化影响
 
 ### 使用提示
 - 本地音频：选择“本地音频文件”并上传；
