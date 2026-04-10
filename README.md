@@ -13,7 +13,7 @@
 ## English
 
 ### What it does
-Transcribe audio to text with Google Generative AI (Gemini). Optionally fetch audio from video sites via `yt-dlp` and then transcribe. Support direct video URL download with automatic proxy detection. Support Douyin short-link/share-text via Tiksave to fetch MP3 direct link and then transcribe. Default model is `gemini-2.5-flash`.
+Transcribe audio to text with Google Gen AI. You can authenticate either with a Gemini API key or with a Vertex AI service account JSON. Optionally fetch audio from video sites via `yt-dlp` and then transcribe. Support direct video URL download with automatic proxy detection. Support Douyin short-link/share-text via Tiksave to fetch MP3 direct link and then transcribe. Default model is `gemini-2.5-flash`.
 
 - Reference: [`yt-dlp` README](https://github.com/yt-dlp/yt-dlp/blob/master/README.md)
 - Supported sites: [`yt-dlp` Supported Sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)
@@ -25,22 +25,34 @@ Tested in this project with YouTube (built-in `--youtube`) and Bilibili (downloa
 pip install -r requirements.txt
 ```
 
+If you want to run the Telegram bot, create `.env` from `.env.example` and fill in:
+
+```bash
+cp .env.example .env
+```
+
 Or install manually:
 
 ```bash
-pip install google-generativeai
+pip install google-genai
+pip install google-auth
 pip install yt-dlp
 pip install requests
 ```
 
 Optional: install `ffmpeg` for more robust audio extraction. Without it, the script falls back to the original audio format.
 
-### API Key
-- Option A: Environment variable `GOOGLE_API_KEY` (or `GEMINI_API_KEY`)
+### Authentication
+- Option A: Gemini API key
+  - Environment variable `GOOGLE_API_KEY` (or `GEMINI_API_KEY`)
   - Windows CMD: `set GOOGLE_API_KEY=YOUR_KEY`
   - PowerShell: `$env:GOOGLE_API_KEY="YOUR_KEY"`
   - macOS/Linux: `export GOOGLE_API_KEY="YOUR_KEY"`
-- Option B: `--api-key YOUR_KEY` CLI flag
+- Option B: Vertex AI service account JSON
+  - CLI: `--auth-mode vertex_ai_json --vertex-json /path/to/service-account.json --vertex-project YOUR_PROJECT --vertex-location us-central1`
+  - Web UI: select `Vertex AI service account JSON`, upload the JSON file, and fill project/location if needed
+  - Environment fallback: `GOOGLE_APPLICATION_CREDENTIALS` or `VERTEX_SERVICE_ACCOUNT_FILE`
+- `--auth-mode` defaults to `gemini_api_key`
 
 ### Proxy Configuration
 The program automatically uses proxy settings from system environment variables. Supported environment variables:
@@ -57,6 +69,19 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
   ```bash
   python main.py --audio ./path/to/audio.m4a --lang en --api-key YOUR_KEY
   ```
+
+- Telegram bot:
+  ```bash
+  python telegram_bot.py
+  ```
+  - Required in `.env`: `ENV_BOT_TOKEN`, `ENV_BOT_SECRET`
+  - If you start `python fastapi/run.py` with the same `.env`, the FastAPI process will also start Telegram polling automatically
+  - First use in Telegram: send `/start`, enter the password, then use Telegram's left command menu to trigger `/setauth` and `/setsource`
+  - `/setauth` and `/setsource` will show inline choice buttons in the chat instead of a persistent bottom keyboard
+  - Gemini mode: use `/setkey <Gemini API Key>` or trigger `/setkey` from the left command menu
+  - Vertex mode: use `/setvertexjson` / `/setvertexproject` / `/setvertexlocation`, or trigger them from the left command menu
+  - The bot persists each Telegram user's auth settings, model, prompt, and source type
+  - Transcript output is streamed in Telegram by incremental message updates, and the final `.txt` file is sent after completion
 
 - YouTube (auto download to `./data` and transcribe, In theory, all websites in the yt-dlp list support):
   ```bash
@@ -82,6 +107,7 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
 - Model selection:
   ```bash
   python main.py --audio ./a.mp3 --model gemini-2.5-flash --api-key YOUR_KEY
+  python main.py --audio ./a.mp3 --auth-mode vertex_ai_json --vertex-json ./service-account.json --vertex-project YOUR_PROJECT
   ```
 
 ### Output
@@ -93,7 +119,9 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
 ### CLI options (excerpt)
 - `--audio`, `--youtube`, `--model`, `--lang`, `--out`
 - `--proxy`, `--proxy-http`, `--proxy-https`
-- `--api-key` (or env var `GOOGLE_API_KEY`/`GEMINI_API_KEY`)
+- `--auth-mode`, `--api-key`
+- `--vertex-json`, `--vertex-project`, `--vertex-location`
+- env vars: `GOOGLE_API_KEY`/`GEMINI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`, `VERTEX_SERVICE_ACCOUNT_FILE`, `VERTEX_PROJECT`, `VERTEX_LOCATION`
 
 ---
 
@@ -130,15 +158,27 @@ pip install -r requirements.txt
 或者手动安装：
 
 ```bash
-pip install google-generativeai
+pip install google-genai
+pip install google-auth
 pip install yt-dlp
 pip install requests
 ```
 
 2)（可选）安装 `ffmpeg`：用于更稳定的音频提取与转码。未安装时，程序会自动回退为原始音频格式。
 
-### 配置 API Key
-- 方式一（推荐）：设置环境变量 `GOOGLE_API_KEY`（或 `GEMINI_API_KEY`）
+3) 如需启用 Telegram 机器人，先复制环境变量示例并填写：
+
+```bash
+cp .env.example .env
+```
+
+至少需要：
+- `ENV_BOT_TOKEN`: Telegram BotFather 创建的机器人 token
+- `ENV_BOT_SECRET`: 首次 `/start` 时用户需要输入的密码
+
+### 配置认证
+- 方式一：Gemini API Key
+  - 设置环境变量 `GOOGLE_API_KEY`（或 `GEMINI_API_KEY`）
   - Windows CMD:
     ```bat
     set GOOGLE_API_KEY=你的密钥
@@ -151,7 +191,13 @@ pip install requests
     ```bash
     export GOOGLE_API_KEY="你的密钥"
     ```
-- 方式二：运行时通过 `--api-key` 参数传入
+- 方式二：Vertex AI service account JSON
+  - 命令行：
+    ```bash
+    python main.py --audio ./path/to/audio.m4a --auth-mode vertex_ai_json --vertex-json ./service-account.json --vertex-project YOUR_PROJECT --vertex-location us-central1
+    ```
+  - Web UI：在“API 配置”里选择 `Vertex AI service account JSON`，上传 JSON 文件并填写项目/地域
+  - 环境变量兜底：`GOOGLE_APPLICATION_CREDENTIALS` 或 `VERTEX_SERVICE_ACCOUNT_FILE`
 
 ### 代理配置
 程序会自动使用系统环境变量中的代理设置，支持以下环境变量：
@@ -184,7 +230,21 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
 - 本地音频转写：
   ```bash
   python main.py --audio ./path/to/audio.m4a --lang zh --api-key YOUR_KEY
+  python main.py --audio ./path/to/audio.m4a --auth-mode vertex_ai_json --vertex-json ./service-account.json --vertex-project YOUR_PROJECT
   ```
+
+- Telegram 机器人：
+  ```bash
+  python telegram_bot.py
+  ```
+  - 如果你是用 `python fastapi/run.py` 启动 Web 服务，只要同一个 `.env` 里配置了 `ENV_BOT_TOKEN` 和 `ENV_BOT_SECRET`，FastAPI 进程也会自动启动 Telegram polling
+  - 首次使用：在 Telegram 中发送 `/start`，按提示先输入 `ENV_BOT_SECRET`
+  - 验证通过后，使用 Telegram 左下角命令菜单完成配置，不再显示常驻底部键盘
+  - `/setauth` 与 `/setsource` 会在消息里弹出内联选择按钮
+  - 常用命令包括 `/settings`、`/setauth`、`/setkey`、`/setvertexjson`、`/setvertexproject`、`/setvertexlocation`、`/setmodel`、`/setsource`、`/setprompt`、`/resetprompt`、`/cancel`
+  - 也支持直接发送 `/setauth gemini`、`/setsource audio` 这类带参数命令
+  - 机器人会按 Telegram 用户分别保存这些配置
+  - 转写过程会流式输出，完成后会附带 `.txt` 文件
 
 - 直接处理 YouTube 链接（自动下载到 `./data` 后转写，理论上 yt-dlp 列表内的网站都支持）：
   ```bash
@@ -231,6 +291,7 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
 - `--lang`: 语言提示（如 `zh`/`en`/`ja`）
 - `--out`: 输出文本路径（可选）
 - `--proxy` / `--proxy-http` / `--proxy-https`: 代理设置
-- `--api-key`: 直接传入 API Key（或使用环境变量）
-
-
+- `--auth-mode`: `gemini_api_key` 或 `vertex_ai_json`
+- `--api-key`: Gemini API Key（或使用环境变量）
+- `--vertex-json`: Vertex AI service account JSON 文件路径
+- `--vertex-project` / `--vertex-location`: Vertex AI 认证参数

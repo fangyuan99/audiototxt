@@ -20,13 +20,19 @@ python -m pip install -r requirements.txt
 2) 启动服务（项目根目录）：
 ```bash
 python fastapi/run.py
+python fastapi/run.py --port 8333
 ```
 
-3) 打开浏览器访问：`http://127.0.0.1:8000/`
+如果项目根目录 `.env` 里配置了 `ENV_BOT_TOKEN` 和 `ENV_BOT_SECRET`，运行 `fastapi/run.py` 时也会一并启动 Telegram bot polling，不需要再额外开一个 `python telegram_bot.py` 进程。
 
-### API Key 与代理
-- API Key：
-  - 页面表单可直接填写；或使用环境变量 `GOOGLE_API_KEY`（或 `GEMINI_API_KEY`）。
+3) 打开浏览器访问：`http://127.0.0.1:8000/`
+   如果用了 `--port 8333`，则访问 `http://127.0.0.1:8333/`
+
+### 认证与代理
+- 认证：
+  - 页面表单可在 `Gemini API Key` 和 `Vertex AI service account JSON` 之间切换；
+  - Gemini 模式可直接填写 API Key，或使用环境变量 `GOOGLE_API_KEY`（或 `GEMINI_API_KEY`）；
+  - Vertex 模式可上传 service account JSON，并填写 `project id` / `location`，或依赖 `GOOGLE_APPLICATION_CREDENTIALS` / `VERTEX_SERVICE_ACCOUNT_FILE`。
 - 代理：
   - 默认读取系统环境变量 `HTTP_PROXY/HTTPS_PROXY`；
   - 页面表单支持覆盖：`代理（统一）/HTTP 代理/HTTPS 代理`。
@@ -53,8 +59,9 @@ python fastapi/run.py
 - 模型：默认 `gemini-2.5-flash`，可在页面调整。
 
 ### 常见问题
-- 端口占用：修改 `fastapi/run.py` 中端口，或关闭占用进程；
+- 端口占用：使用 `python fastapi/run.py --port 8333` 或设置环境变量 `PORT=8333`，或者关闭占用进程；
 - 无法导入依赖：再次执行 `python -m pip install -r requirements.txt`；
+- Telegram `/start` 没反应：确认当前是通过 `python fastapi/run.py` 或 `python telegram_bot.py` 启动，且 `.env` 中已配置有效的 `ENV_BOT_TOKEN` / `ENV_BOT_SECRET`；验证通过后请使用 Telegram 左下角命令菜单，`/setauth` 和 `/setsource` 会在消息里弹出内联按钮；
 - `ffmpeg` 未安装：视频直链将无法抽音，请安装并加入 PATH；
 - 无进度/无分片：确认已重启服务，且网络/代理可访问外部站点与 Gemini；
 - 抖音失败：可能为 Tiksave 接口变化或网络受限，请更换网络或来源方式。
@@ -62,4 +69,3 @@ python fastapi/run.py
 ### 安全与边界
 - 下载接口仅允许 `./data` 目录下的文件；
 - 请遵守各网站服务条款与当地法律，合理合法使用本工具。
-
