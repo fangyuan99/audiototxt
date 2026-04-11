@@ -13,12 +13,12 @@
 ## English
 
 ### What it does
-Transcribe audio to text with Google Gen AI. You can authenticate either with a Gemini API key or with a Vertex AI service account JSON. Optionally fetch audio from video sites via `yt-dlp` and then transcribe. Support direct video URL download with automatic proxy detection. Support Douyin short-link/share-text via Tiksave to fetch MP3 direct link and then transcribe. Default model is `gemini-2.5-flash`.
+Transcribe audio to text with Google Gen AI. You can authenticate either with a Gemini API key or with a Vertex AI service account JSON. YouTube links are sent directly to Gemini without downloading the video first. Support direct video URL download with automatic proxy detection. Support Douyin short-link/share-text via Tiksave to fetch MP3 direct link and then transcribe. Default model is `gemini-2.5-flash`.
 
-- Reference: [`yt-dlp` README](https://github.com/yt-dlp/yt-dlp/blob/master/README.md)
-- Supported sites: [`yt-dlp` Supported Sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)
+- Reference: [Gemini video understanding](https://ai.google.dev/gemini-api/docs/video-understanding)
+- Reference: [Gemini media resolution](https://ai.google.dev/gemini-api/docs/media-resolution)
 
-Tested in this project with YouTube (built-in `--youtube`) and Bilibili (download via `yt-dlp` first, then pass `--audio`). Use in compliance with sites' ToS and local laws.
+Tested in this project with YouTube (built-in `--youtube`, public videos only). Use in compliance with sites' ToS and local laws.
 
 ### Setup
 ```bash
@@ -77,13 +77,13 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
   - Required in `.env`: `ENV_BOT_TOKEN`, `ENV_BOT_SECRET`
   - If you start `python fastapi/run.py` with the same `.env`, the FastAPI process will also start Telegram polling automatically
   - First use in Telegram: send `/start`, enter the password, then use Telegram's left command menu to trigger `/setauth` and `/setsource`
-  - `/setauth` and `/setsource` will show inline choice buttons in the chat instead of a persistent bottom keyboard
+  - `/setauth` and `/setsource` no longer show chat buttons; after triggering them, just reply with `gemini` / `vertex` or `audio` / `youtube` / `video_url` / `douyin`
   - Gemini mode: use `/setkey <Gemini API Key>` or trigger `/setkey` from the left command menu
   - Vertex mode: use `/setvertexjson` / `/setvertexproject` / `/setvertexlocation`, or trigger them from the left command menu
   - The bot persists each Telegram user's auth settings, model, prompt, and source type
   - Transcript output is streamed in Telegram by incremental message updates, and the final `.txt` file is sent after completion
 
-- YouTube (auto download to `./data` and transcribe, In theory, all websites in the yt-dlp list support):
+- YouTube (Gemini reads the public YouTube URL directly, no local download):
   ```bash
   python main.py --youtube https://www.youtube.com/watch?v=VIDEO_ID --lang en --api-key YOUR_KEY
   ```
@@ -131,7 +131,7 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
 
 ### 功能特性
 - 本地音频转写（WAV/MP3/M4A 等常见格式）
-- 一键下载 YouTube 音频并转写（需 `yt-dlp`，可选安装 `ffmpeg` 以获得更高质量/更好兼容的音频）
+- 直接通过 Gemini 读取 YouTube 链接并转写（仅支持公开视频，无需先下载）
 - 视频直链下载和音频提取（自动使用系统代理）
 - 抖音分享口令/短链通过 Tiksave 提取 MP3 直链后下载并转写
 - 流式输出到标准输出，同时将完整文本保存为 `.txt`
@@ -140,11 +140,8 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
 - 自动使用系统环境变量中的代理设置
 
 ### 支持网站
-- 完整站点列表请见：`yt-dlp` 的支持网站页面
-  - https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md
 - 当前已在本项目中亲测站点：
-  - YouTube（命令行内置 `--youtube` 直连下载与转写）
-  - Bilibili（通过 `yt-dlp` 先下载音频，再使用 `--audio` 转写）
+  - YouTube（命令行内置 `--youtube`，通过 Gemini 直连转写）
 
 请在遵守各网站服务条款与当地法律的前提下合规使用。
 
@@ -240,13 +237,13 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
   - 如果你是用 `python fastapi/run.py` 启动 Web 服务，只要同一个 `.env` 里配置了 `ENV_BOT_TOKEN` 和 `ENV_BOT_SECRET`，FastAPI 进程也会自动启动 Telegram polling
   - 首次使用：在 Telegram 中发送 `/start`，按提示先输入 `ENV_BOT_SECRET`
   - 验证通过后，使用 Telegram 左下角命令菜单完成配置，不再显示常驻底部键盘
-  - `/setauth` 与 `/setsource` 会在消息里弹出内联选择按钮
+  - `/setauth` 与 `/setsource` 不再弹按钮，触发后直接按提示回复参数即可
   - 常用命令包括 `/settings`、`/setauth`、`/setkey`、`/setvertexjson`、`/setvertexproject`、`/setvertexlocation`、`/setmodel`、`/setsource`、`/setprompt`、`/resetprompt`、`/cancel`
   - 也支持直接发送 `/setauth gemini`、`/setsource audio` 这类带参数命令
   - 机器人会按 Telegram 用户分别保存这些配置
   - 转写过程会流式输出，完成后会附带 `.txt` 文件
 
-- 直接处理 YouTube 链接（自动下载到 `./data` 后转写，理论上 yt-dlp 列表内的网站都支持）：
+- 直接处理 YouTube 链接（通过 Gemini 直连转写，不先下载视频）：
   ```bash
   python main.py --youtube https://www.youtube.com/watch?v=VIDEO_ID --lang zh --api-key YOUR_KEY
   ```
@@ -284,12 +281,13 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
 
 ### 可用参数（摘录）
 - `--audio`: 本地音频文件路径
-- `--youtube`: YouTube 视频链接（自动下载音频）
+- `--youtube`: YouTube 视频链接（Gemini 直连转写，仅支持公开视频）
 - `--video-url`: 视频直链URL（自动下载视频并提取音频）
 - `--douyin`: 抖音分享口令或短链（自动解析并下载音频）
 - `--model`: 模型名称（默认 `gemini-2.5-flash`）
 - `--lang`: 语言提示（如 `zh`/`en`/`ja`）
 - `--out`: 输出文本路径（可选）
+- `--media-resolution`: YouTube 直连时传给 Gemini 的媒体分辨率，默认 `low`
 - `--proxy` / `--proxy-http` / `--proxy-https`: 代理设置
 - `--auth-mode`: `gemini_api_key` 或 `vertex_ai_json`
 - `--api-key`: Gemini API Key（或使用环境变量）

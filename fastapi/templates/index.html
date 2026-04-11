@@ -89,18 +89,6 @@
               </button>
             </fieldset>
           </div>
-          <div class="conditional" data-for="youtube">
-            <label for="cookies_file">
-              Cookies 文件（可选）
-              <input
-                type="file"
-                id="cookies_file"
-                name="cookies_file"
-                accept=".txt,.cookies"
-              />
-            </label>
-          </div>
-
           <!-- 视频直链输入 -->
           <div class="conditional" data-for="video_url">
             <label for="video_url_input">视频直链</label>
@@ -122,15 +110,53 @@
           <!-- API 配置 -->
           <details>
             <summary>API 配置</summary>
-            <label for="api_key">
-              Gemini API Key
-              <input
-                type="password"
-                id="api_key"
-                name="api_key"
-                placeholder="未填写则读取环境变量"
-              />
+            <label for="auth_mode">
+              认证方式
+              <select id="auth_mode" name="auth_mode">
+                <option value="gemini_api_key">Gemini API Key</option>
+                <option value="vertex_ai_json">Vertex AI service account JSON</option>
+              </select>
             </label>
+            <div class="conditional auth-conditional" data-auth-for="gemini_api_key">
+              <label for="api_key">
+                Gemini API Key
+                <input
+                  type="password"
+                  id="api_key"
+                  name="api_key"
+                  placeholder="未填写则读取环境变量"
+                />
+              </label>
+            </div>
+            <div class="conditional auth-conditional" data-auth-for="vertex_ai_json">
+              <label for="vertex_json_file">
+                Vertex AI service account JSON
+                <input
+                  type="file"
+                  id="vertex_json_file"
+                  name="vertex_json_file"
+                  accept=".json,application/json"
+                />
+              </label>
+              <label for="vertex_project">
+                Vertex project ID
+                <input
+                  type="text"
+                  id="vertex_project"
+                  name="vertex_project"
+                  placeholder="可空，默认读取 JSON 或 GOOGLE_CLOUD_PROJECT"
+                />
+              </label>
+              <label for="vertex_location">
+                Vertex location
+                <input
+                  type="text"
+                  id="vertex_location"
+                  name="vertex_location"
+                  placeholder="例如 us-central1，默认 global"
+                />
+              </label>
+            </div>
             <label for="model_name">
               模型
               <input

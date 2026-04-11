@@ -21,7 +21,6 @@ if ROOT_DIR not in sys.path:
 from main import (  # noqa: E402
     transcribe_audio_streaming,
     transcribe_youtube_url_streaming,
-    download_audio_from_youtube,
     download_video_and_extract_audio,
     fetch_douyin_mp3_via_tiksave,
     download_audio_from_direct_url,
@@ -66,6 +65,36 @@ async def startup_event():
     if cleanup_hours > 0:
         start_cleanup_timer(DATA_DIR, cleanup_hours)
         print(f"FastAPI: 已启动定时清理任务，每 {cleanup_hours} 小时清理一次", file=sys.stderr)
+
+    app.state.telegram_bot_app = None
+    token = os.getenv("ENV_BOT_TOKEN", "").strip()
+    if not token:
+        return
+
+    try:
+        from telegram_bot import build_application, start_embedded_polling
+
+        telegram_app = build_application()
+        await start_embedded_polling(telegram_app)
+        app.state.telegram_bot_app = telegram_app
+        print("FastAPI: Telegram bot polling 已启动", file=sys.stderr)
+    except Exception as exc:
+        print(f"FastAPI: Telegram bot 启动失败: {exc}", file=sys.stderr)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    telegram_app = getattr(app.state, "telegram_bot_app", None)
+    if telegram_app is None:
+        return
+
+    try:
+        from telegram_bot import stop_embedded_polling
+
+        await stop_embedded_polling(telegram_app)
+        print("FastAPI: Telegram bot polling 已停止", file=sys.stderr)
+    except Exception as exc:
+        print(f"FastAPI: Telegram bot 停止失败: {exc}", file=sys.stderr)
 
 
 async def publish(job_id: str, event: Dict[str, Any]) -> None:
@@ -167,8 +196,12 @@ async def _run_task(
     job_id: str,
     source_type: str,
     api_key: Optional[str],
+    auth_mode: Optional[str],
     model_name: str,
     language_hint: Optional[str],
+    vertex_json: Optional[str],
+    vertex_project: Optional[str],
+    vertex_location: Optional[str],
     uploaded_file: Optional[UploadFile],
     youtube_url: Optional[str],
     video_url: Optional[str],
@@ -176,7 +209,6 @@ async def _run_task(
     proxy: Optional[str],
     proxy_http: Optional[str],
     proxy_https: Optional[str],
-    cookies_file: Optional[UploadFile] = None,
 ) -> None:
     async with jobs_lock:
         job = jobs.get(job_id)
@@ -218,11 +250,16 @@ async def _run_task(
                 chunk_cb = _make_chunk_callback(job_id, job)
                 transcript = await asyncio.to_thread(
                     transcribe_youtube_url_streaming,
-                    api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "",
+                    api_key,
                     youtube_url,
                     model_name,
                     language_hint,
+                    None,
                     chunk_cb,
+                    auth_mode,
+                    vertex_json,
+                    vertex_project,
+                    vertex_location,
                 )
                 # Derive a filename from YouTube video id
                 try:
@@ -271,11 +308,16 @@ async def _run_task(
                 chunk_cb = _make_chunk_callback(job_id, job)
                 transcript = await asyncio.to_thread(
                     transcribe_audio_streaming,
-                    api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "",
+                    api_key,
                     audio_path,
                     model_name,
                     language_hint,
+                    None,
                     chunk_cb,
+                    auth_mode,
+                    vertex_json,
+                    vertex_project,
+                    vertex_location,
                 )
 
         # Persist transcript similar to main.py
@@ -299,7 +341,7 @@ async def _run_task(
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
 
 
 @app.get("/health")
@@ -312,8 +354,11 @@ async def api_transcribe(
     request: Request,
     source_type: str = Form(...),
     api_key: Optional[str] = Form(None),
+    auth_mode: str = Form("gemini_api_key"),
     model_name: str = Form("gemini-2.5-flash"),
     language_hint: Optional[str] = Form(None),
+    vertex_project: Optional[str] = Form(None),
+    vertex_location: Optional[str] = Form(None),
     proxy: Optional[str] = Form(None),
     proxy_http: Optional[str] = Form(None),
     proxy_https: Optional[str] = Form(None),
@@ -321,12 +366,17 @@ async def api_transcribe(
     video_url: Optional[str] = Form(None),
     douyin_text: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
-    cookies_file: Optional[UploadFile] = File(None),
+    vertex_json_file: Optional[UploadFile] = File(None),
 ):
     job_id = uuid.uuid4().hex
     job = JobState(status="pending", message="")
     async with jobs_lock:
         jobs[job_id] = job
+
+    vertex_json = None
+    if vertex_json_file is not None:
+        raw = await vertex_json_file.read()
+        vertex_json = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
 
     # Spawn background task
     asyncio.create_task(
@@ -334,8 +384,12 @@ async def api_transcribe(
             job_id=job_id,
             source_type=source_type,
             api_key=api_key,
+            auth_mode=auth_mode,
             model_name=model_name,
             language_hint=language_hint,
+            vertex_json=vertex_json,
+            vertex_project=vertex_project,
+            vertex_location=vertex_location,
             uploaded_file=file,
             youtube_url=youtube_url,
             video_url=video_url,
@@ -343,7 +397,6 @@ async def api_transcribe(
             proxy=proxy,
             proxy_http=proxy_http,
             proxy_https=proxy_https,
-            cookies_file=cookies_file,
         )
     )
 
@@ -434,5 +487,3 @@ async def api_list_files():
         })
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
-
-

@@ -1,4 +1,5 @@
 const sourceSelect = document.getElementById("source_type");
+const authSelect = document.getElementById("auth_mode");
 const form = document.getElementById("task-form");
 const statusArea = document.getElementById("status-area");
 const outputPre = document.getElementById("output");
@@ -25,12 +26,21 @@ function formatElapsed(ms) {
 }
 
 function renderConditionals() {
-  const all = document.querySelectorAll(".conditional");
+  const sourceConditionals = document.querySelectorAll(".conditional[data-for]");
   const selected = sourceSelect.value;
-  all.forEach((el) => {
+  sourceConditionals.forEach((el) => {
     const forType = el.getAttribute("data-for");
     // 默认隐藏，匹配时显示
     el.style.display = forType === selected ? "" : "none";
+  });
+}
+
+function renderAuthConditionals() {
+  const all = document.querySelectorAll(".auth-conditional");
+  const selected = authSelect ? authSelect.value : "gemini_api_key";
+  all.forEach((el) => {
+    const forMode = el.getAttribute("data-auth-for");
+    el.style.display = forMode === selected ? "" : "none";
   });
 }
 
@@ -40,7 +50,9 @@ document.querySelectorAll(".conditional").forEach((el) => {
 });
 
 sourceSelect.addEventListener("change", renderConditionals);
+authSelect?.addEventListener("change", renderAuthConditionals);
 renderConditionals();
+renderAuthConditionals();
 
 function getNowTimeString() {
   const d = new Date();
@@ -224,9 +236,12 @@ copyBtn?.addEventListener("click", async () => {
 // Persist & restore form values
 const PERSIST_KEYS = [
   "source_type",
+  "auth_mode",
   "api_key",
   "model_name",
   "language_hint",
+  "vertex_project",
+  "vertex_location",
   "proxy",
   "proxy_http",
   "proxy_https",
@@ -259,6 +274,7 @@ function restoreFormFromLocalStorage() {
       }
     }
     renderConditionals();
+    renderAuthConditionals();
   } catch (e) {}
 }
 

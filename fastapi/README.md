@@ -4,12 +4,13 @@
 
 ### 功能
 - 可视化页面操作（表单选择来源，一键开始）
-- 实时进度同步（WebSocket 推送：下载进度/处理状态/转写中）
+- 实时进度同步（WebSocket 推送：处理状态/转写中）
 - 流式转写展示（边生成边追加到页面）
 - 一键复制全文（转写区域“复制全文”按钮）
 - 结果下载（转写完成后提供 `.txt` 下载链接）
 - 表单配置持久化（localStorage 自动保存与恢复）
 - 支持来源：本地文件、YouTube 链接、视频直链、抖音分享口令/短链（Tiksave）
+- YouTube 链接通过 Gemini 直连转写，不会先下载到本地（仅支持公开视频）
 
 ### 运行
 1) 安装依赖（项目根目录）：
@@ -52,7 +53,7 @@ python fastapi/run.py --port 8333
 
 ### 使用提示
 - 本地音频：选择“本地音频文件”并上传；
-- YouTube：粘贴链接；
+- YouTube：粘贴公开视频链接；
 - 视频直链：粘贴视频 URL（需 `ffmpeg` 抽音）；
 - 抖音：粘贴分享口令或短链，系统会解析 MP3 直链后下载；
 - 语言提示：填写 `zh/en/ja` 等，辅助模型更稳地识别语种；
@@ -61,7 +62,7 @@ python fastapi/run.py --port 8333
 ### 常见问题
 - 端口占用：使用 `python fastapi/run.py --port 8333` 或设置环境变量 `PORT=8333`，或者关闭占用进程；
 - 无法导入依赖：再次执行 `python -m pip install -r requirements.txt`；
-- Telegram `/start` 没反应：确认当前是通过 `python fastapi/run.py` 或 `python telegram_bot.py` 启动，且 `.env` 中已配置有效的 `ENV_BOT_TOKEN` / `ENV_BOT_SECRET`；验证通过后请使用 Telegram 左下角命令菜单，`/setauth` 和 `/setsource` 会在消息里弹出内联按钮；
+- Telegram `/start` 没反应：确认当前是通过 `python fastapi/run.py` 或 `python telegram_bot.py` 启动，且 `.env` 中已配置有效的 `ENV_BOT_TOKEN` / `ENV_BOT_SECRET`；验证通过后请使用 Telegram 左下角命令菜单，`/setauth` 和 `/setsource` 触发后直接按提示回复参数；
 - `ffmpeg` 未安装：视频直链将无法抽音，请安装并加入 PATH；
 - 无进度/无分片：确认已重启服务，且网络/代理可访问外部站点与 Gemini；
 - 抖音失败：可能为 Tiksave 接口变化或网络受限，请更换网络或来源方式。

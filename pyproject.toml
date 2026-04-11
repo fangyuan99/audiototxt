@@ -1,0 +1,20 @@
+[project]
+name = "audiototxt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.110.0",
+    "google-genai",
+    "google-auth",
+    "jinja2>=3.1",
+    "pydantic>=2.4,<3",
+    "python-dotenv>=1.0",
+    "python-multipart>=0.0.9",
+    "python-telegram-bot>=21,<22",
+    "requests>=2.33.1",
+    "starlette>=0.36.3",
+    "uvicorn[standard]>=0.24",
+    "yt-dlp>=2026.3.17",
+]

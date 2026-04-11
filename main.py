@@ -1,11 +1,23 @@
 import argparse
+import json
 import os
 import sys
 import time
 import re
 import threading
 import glob
+from dataclasses import dataclass
 from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency fallback
+    def load_dotenv(*args, **kwargs):
+        return False
+
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(ROOT_DIR, ".env"))
 
 SYSTEM_PROMPT = """
 你是一名专业的听打员，只做逐字转写以及进行合理的合并与分段，不做任何总结、解释或翻译.
@@ -24,6 +36,19 @@ CONTENT_PROMPT = """
 "- 严禁翻译或补充外部信息；\n"
 "- 输出为纯文本。"
 """
+
+
+def build_transcription_prompt(
+    language_hint: Optional[str] = "zh",
+    promoters: Optional[str] = None,
+) -> str:
+    """Build the final transcription prompt with optional user-defined override."""
+    base_prompt = (promoters or "").strip()
+    if not base_prompt:
+        base_prompt = f"{SYSTEM_PROMPT}\n\n{CONTENT_PROMPT}"
+
+    language_line = f"主要语言：{language_hint}" if language_hint else "主要语言：按音频原语言"
+    return f"{base_prompt}\n\n{language_line}"
 
 
 def set_proxies(proxy: Optional[str], proxy_http: Optional[str], proxy_https: Optional[str]) -> None:
@@ -45,22 +70,157 @@ def set_proxies(proxy: Optional[str], proxy_http: Optional[str], proxy_https: Op
         os.environ["https_proxy"] = https_proxy
 
 
-def ensure_package() -> None:
-    """Ensure google-generativeai is available; otherwise, guide the user."""
+AUTH_MODE_GEMINI_API_KEY = "gemini_api_key"
+AUTH_MODE_VERTEX_AI_JSON = "vertex_ai_json"
+
+
+@dataclass
+class GeminiAuthConfig:
+    auth_mode: str = AUTH_MODE_GEMINI_API_KEY
+    api_key: str = ""
+    vertex_json: str = ""
+    vertex_project: str = ""
+    vertex_location: str = "global"
+
+
+def normalize_auth_mode(auth_mode: Optional[str]) -> str:
+    value = (auth_mode or AUTH_MODE_GEMINI_API_KEY).strip().lower().replace("-", "_")
+    aliases = {
+        "gemini": AUTH_MODE_GEMINI_API_KEY,
+        "api_key": AUTH_MODE_GEMINI_API_KEY,
+        "gemini_api_key": AUTH_MODE_GEMINI_API_KEY,
+        "vertex": AUTH_MODE_VERTEX_AI_JSON,
+        "vertex_ai": AUTH_MODE_VERTEX_AI_JSON,
+        "vertex_json": AUTH_MODE_VERTEX_AI_JSON,
+        "vertex_ai_json": AUTH_MODE_VERTEX_AI_JSON,
+    }
+    return aliases.get(value, AUTH_MODE_GEMINI_API_KEY)
+
+
+def _read_text_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def build_auth_config(
+    auth_mode: Optional[str] = None,
+    api_key: Optional[str] = None,
+    vertex_json: Optional[str] = None,
+    vertex_project: Optional[str] = None,
+    vertex_location: Optional[str] = None,
+) -> GeminiAuthConfig:
+    mode = normalize_auth_mode(auth_mode)
+    if mode == AUTH_MODE_VERTEX_AI_JSON:
+        json_text = (vertex_json or "").strip()
+        if not json_text:
+            candidate_paths = [
+                os.getenv("VERTEX_SERVICE_ACCOUNT_JSON"),
+                os.getenv("VERTEX_SERVICE_ACCOUNT_FILE"),
+                os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+            ]
+            for candidate in candidate_paths:
+                if candidate and os.path.isfile(candidate):
+                    json_text = _read_text_file(candidate)
+                    break
+
+        location = (
+            vertex_location
+            or os.getenv("VERTEX_LOCATION")
+            or os.getenv("GOOGLE_CLOUD_LOCATION")
+            or "global"
+        ).strip()
+        project = (
+            vertex_project
+            or os.getenv("VERTEX_PROJECT")
+            or os.getenv("GOOGLE_CLOUD_PROJECT")
+            or ""
+        ).strip()
+        return GeminiAuthConfig(
+            auth_mode=mode,
+            vertex_json=json_text,
+            vertex_project=project,
+            vertex_location=location or "global",
+        )
+
+    resolved_api_key = (
+        (api_key or "").strip()
+        or os.getenv("GOOGLE_API_KEY", "").strip()
+        or os.getenv("GEMINI_API_KEY", "").strip()
+    )
+    return GeminiAuthConfig(
+        auth_mode=AUTH_MODE_GEMINI_API_KEY,
+        api_key=resolved_api_key,
+    )
+
+
+def build_genai_client(auth_config: GeminiAuthConfig):
     try:
-        import google.generativeai  # noqa: F401
+        from google import genai
+    except Exception as exc:  # pragma: no cover - runtime guidance only
+        raise RuntimeError(
+            "未检测到 google-genai 包。请先执行 `pip install -r requirements.txt`。"
+        ) from exc
+
+    if auth_config.auth_mode == AUTH_MODE_VERTEX_AI_JSON:
+        if not auth_config.vertex_json.strip():
+            raise RuntimeError("已选择 Vertex AI JSON 认证，但未提供 service account JSON。")
+
+        try:
+            from google.oauth2 import service_account
+        except Exception as exc:  # pragma: no cover - runtime guidance only
+            raise RuntimeError(
+                "Vertex AI JSON 认证需要 google-auth 依赖。请先执行 `pip install -r requirements.txt`。"
+            ) from exc
+
+        try:
+            service_account_info = json.loads(auth_config.vertex_json)
+        except Exception as exc:
+            raise RuntimeError("Vertex AI JSON 不是有效的 service account JSON。") from exc
+
+        credentials = service_account.Credentials.from_service_account_info(
+            service_account_info
+        ).with_scopes(["https://www.googleapis.com/auth/cloud-platform"])
+        project = (
+            auth_config.vertex_project.strip()
+            or service_account_info.get("project_id", "")
+            or getattr(credentials, "project_id", "")
+            or os.getenv("GOOGLE_CLOUD_PROJECT", "")
+        ).strip()
+        if not project:
+            raise RuntimeError("Vertex AI JSON 认证需要提供 project_id。")
+
+        location = auth_config.vertex_location.strip() or "global"
+        return genai.Client(
+            vertexai=True,
+            project=project,
+            location=location,
+            credentials=credentials,
+        )
+
+    if not auth_config.api_key.strip():
+        raise RuntimeError(
+            "缺少 Gemini API Key。请通过 --api-key / 页面表单填写，或设置环境变量 GOOGLE_API_KEY / GEMINI_API_KEY。"
+        )
+
+    return genai.Client(api_key=auth_config.api_key.strip())
+
+
+def ensure_package() -> None:
+    """Ensure google-genai is available; otherwise, guide the user."""
+    try:
+        from google import genai  # noqa: F401
     except Exception:  # pragma: no cover - runtime guidance only
         print(
-            "未检测到 google-generativeai 包。请先安装依赖：\n"
+            "未检测到 google-genai 包。请先安装依赖：\n"
             "  pip install -r requirements.txt\n"
             "或：\n"
-            "  pip install google-generativeai",
+            "  pip install google-genai",
             file=sys.stderr,
         )
         sys.exit(2)
 
 
-def wait_for_file_active(genai, file_obj, timeout_seconds: int = 120) -> None:
+def wait_for_file_active(client, file_obj, timeout_seconds: int = 120) -> None:
     """Poll until uploaded file becomes ACTIVE or timeout. 输出简单进度到 stderr。"""
     start_ts = time.time()
     sleep_seconds = 1.0
@@ -69,7 +229,7 @@ def wait_for_file_active(genai, file_obj, timeout_seconds: int = 120) -> None:
     except Exception:
         pass
     while True:
-        file_obj = genai.get_file(file_obj.name)
+        file_obj = client.files.get(name=file_obj.name)
         state = getattr(file_obj, "state", None)
         state_name = getattr(state, "name", state)
         if state_name == "ACTIVE":
@@ -93,35 +253,134 @@ def wait_for_file_active(genai, file_obj, timeout_seconds: int = 120) -> None:
             pass
 
 
+def _collect_stream_text(response_stream, on_chunk=None) -> str:
+    """Collect streamed Gemini text while emitting only new deltas."""
+    emitted_text = ""
+    full_parts = []
+    for chunk in response_stream:
+        text_piece = getattr(chunk, "text", None)
+        if not text_piece:
+            try:
+                candidates = getattr(chunk, "candidates", [])
+                if candidates and candidates[0].content and candidates[0].content.parts:
+                    text_piece = "".join(
+                        part.text
+                        for part in candidates[0].content.parts
+                        if hasattr(part, "text")
+                    )
+            except Exception:
+                text_piece = None
+        if text_piece:
+            if emitted_text and text_piece.startswith(emitted_text):
+                delta = text_piece[len(emitted_text):]
+            else:
+                delta = text_piece
+            if delta:
+                if on_chunk:
+                    on_chunk(delta)
+                else:
+                    print(delta, end="", flush=True)
+                full_parts.append(delta)
+                emitted_text += delta
+
+    return "".join(full_parts).strip()
+
+
+def _build_generate_content_config(types, media_resolution: Optional[str] = None):
+    kwargs = {
+        "temperature": 0.0,
+        "top_p": 0.9,
+        "top_k": 40,
+    }
+    if media_resolution:
+        normalized = media_resolution.strip().upper()
+        if normalized in {"LOW", "HIGH"}:
+            enum_name = f"MEDIA_RESOLUTION_{normalized}"
+        else:
+            enum_name = normalized
+        media_resolution_enum = getattr(
+            getattr(types, "MediaResolution", None),
+            enum_name,
+            enum_name,
+        )
+        kwargs["media_resolution"] = media_resolution_enum
+
+    try:
+        return types.GenerateContentConfig(**kwargs)
+    except Exception:
+        if "media_resolution" not in kwargs:
+            raise
+        print(
+            "当前 google-genai 版本不支持 media_resolution，已忽略该参数。",
+            file=sys.stderr,
+        )
+        kwargs.pop("media_resolution", None)
+        return types.GenerateContentConfig(**kwargs)
+
+
+def _part_from_uri(types, file_uri: str, mime_type: str):
+    try:
+        return types.Part.from_uri(file_uri=file_uri, mime_type=mime_type)
+    except TypeError:
+        return types.Part.from_uri(uri=file_uri, mime_type=mime_type)
+
+
+def _youtube_output_stem(youtube_url: str) -> str:
+    try:
+        from urllib.parse import parse_qs, urlparse
+
+        parsed = urlparse(youtube_url)
+        vid = (parse_qs(parsed.query).get("v") or [None])[0]
+        if not vid and parsed.path:
+            parts = [p for p in parsed.path.split("/") if p]
+            if parts:
+                vid = parts[-1]
+        if vid:
+            safe_vid = re.sub(r"[^A-Za-z0-9_-]+", "_", vid).strip("_")
+            if safe_vid:
+                return f"youtube_{safe_vid}"
+    except Exception:
+        pass
+    return f"youtube_{int(time.time())}"
+
+
 def transcribe_audio_streaming(
-    api_key: str,
+    api_key: Optional[str],
     audio_path: str,
     model_name: str = "gemini-2.5-flash",
     language_hint: Optional[str] = 'zh',
+    promoters: Optional[str] = None,
     on_chunk=None,
+    auth_mode: Optional[str] = None,
+    vertex_json: Optional[str] = None,
+    vertex_project: Optional[str] = None,
+    vertex_location: Optional[str] = None,
 ) -> str:
     """Use Gemini to transcribe an audio file into text with streaming output.
-    
-    Uses Base64 encoding to avoid the ragStoreName error with upload_file.
+
+    Uses inline bytes so the audio can be sent without uploading a file object.
     Returns the full transcript while yielding chunks via on_chunk or stdout.
     """
-    import base64
-    import google.generativeai as genai
+    from google.genai import types
 
-    genai.configure(api_key=api_key)
+    auth_config = build_auth_config(
+        auth_mode=auth_mode,
+        api_key=api_key,
+        vertex_json=vertex_json,
+        vertex_project=vertex_project,
+        vertex_location=vertex_location,
+    )
+    client = build_genai_client(auth_config)
 
     if not os.path.isfile(audio_path):
         raise FileNotFoundError(f"找不到音频文件：{audio_path}")
 
-    # 读取音频文件并进行 Base64 编码
+    # 读取音频文件并构建 inline bytes 输入
     try:
         print(f"读取音频：{os.path.basename(audio_path)}", file=sys.stderr)
         with open(audio_path, 'rb') as audio_file:
             audio_data = audio_file.read()
-        
-        # Base64 编码
-        encoded_string = base64.b64encode(audio_data).decode('utf-8')
-        
+
         # 检测音频文件类型
         file_ext = os.path.splitext(audio_path)[1].lower()
         mime_type_map = {
@@ -138,115 +397,91 @@ def transcribe_audio_streaming(
     except Exception as e:
         raise RuntimeError(f"无法读取音频文件: {str(e)}") from e
 
-    # 系统级约束，尽可能强地限制输出风格，避免跑题/扩写/翻译
-    language_line = f"主要语言：{language_hint}" if language_hint else "主要语言：按音频原语言"
-    
-    # 将系统指令和内容提示合并为完整的提示文本
-    full_prompt = f"{SYSTEM_PROMPT}\n\n{CONTENT_PROMPT}"
-    if language_hint:
-        full_prompt += f"\n{language_line}"
-
-    generation_config = {
-        "temperature": 0.0,
-        "top_p": 0.9,
-        "top_k": 40,
-    }
-
-    # 兼容旧版本，不使用 system_instruction 参数
-    model = genai.GenerativeModel(
-        model_name,
-        generation_config=generation_config,
+    full_prompt = build_transcription_prompt(
+        language_hint=language_hint,
+        promoters=promoters,
     )
 
-    # 构建内容数据，使用 Base64 编码避免 ragStoreName 错误
-    content_data = {
-        "inline_data": {
-            "mime_type": mime_type,
-            "data": encoded_string
-        }
-    }
+    content_data = types.Part.from_bytes(data=audio_data, mime_type=mime_type)
+    config = _build_generate_content_config(types)
 
     try:
         print("开始转写...", file=sys.stderr)
     except Exception:
         pass
     
-    # 使用 Base64 编码的音频数据进行流式生成
-    response_stream = model.generate_content([
-        content_data,
-        full_prompt,
-    ], stream=True)
-
-    # 增量去重：规避某些实现中分片重复回放导致的重复内容
-    emitted_text = ""
-    full_parts = []
-    for chunk in response_stream:
-        text_piece = getattr(chunk, "text", None)
-        if not text_piece:
-            try:
-                candidates = getattr(chunk, "candidates", [])
-                if candidates and candidates[0].content and candidates[0].content.parts:
-                    text_piece = "".join(
-                        part.text for part in candidates[0].content.parts if hasattr(part, "text")
-                    )
-            except Exception:
-                text_piece = None
-        if text_piece:
-            # 如果 text_piece 是累计文本，计算新追加的增量；否则按原始片段输出
-            if emitted_text and text_piece.startswith(emitted_text):
-                delta = text_piece[len(emitted_text):]
-            else:
-                delta = text_piece
-            if delta:
-                if on_chunk:
-                    on_chunk(delta)
-                else:
-                    print(delta, end="", flush=True)
-                full_parts.append(delta)
-                emitted_text += delta
-
-    # Finalize to ensure the aggregated response is complete
     try:
-        response_stream.resolve()
-    except Exception:
-        pass
+        response_stream = client.models.generate_content_stream(
+            model=model_name,
+            contents=[content_data, full_prompt],
+            config=config,
+        )
 
-    transcript = "".join(full_parts).strip()
-    try:
-        print(f"转写完成（约 {len(transcript)} 字符）", file=sys.stderr)
-    except Exception:
-        pass
-    return transcript
+        transcript = _collect_stream_text(response_stream, on_chunk=on_chunk)
+        try:
+            print(f"转写完成（约 {len(transcript)} 字符）", file=sys.stderr)
+        except Exception:
+            pass
+        return transcript
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def transcribe_youtube_url_streaming(
-    api_key: str,
+    api_key: Optional[str],
     youtube_url: str,
     model_name: str = "gemini-2.5-flash",
     language_hint: Optional[str] = 'zh',
+    promoters: Optional[str] = None,
     on_chunk=None,
+    auth_mode: Optional[str] = None,
+    vertex_json: Optional[str] = None,
+    vertex_project: Optional[str] = None,
+    vertex_location: Optional[str] = None,
+    media_resolution: Optional[str] = "low",
 ) -> str:
-    """Use Gemini to transcribe a YouTube URL by downloading and processing locally.
+    """Use Gemini to transcribe a public YouTube URL directly without downloading."""
+    from google.genai import types
 
-    This downloads the audio locally first, then uses the standard audio transcription.
-    """
-    import tempfile
+    auth_config = build_auth_config(
+        auth_mode=auth_mode,
+        api_key=api_key,
+        vertex_json=vertex_json,
+        vertex_project=vertex_project,
+        vertex_location=vertex_location,
+    )
+    client = build_genai_client(auth_config)
 
-    # 下载 YouTube 音频到临时文件
+    full_prompt = build_transcription_prompt(
+        language_hint=language_hint,
+        promoters=promoters,
+    )
+    video_part = _part_from_uri(types, youtube_url, "video/mp4")
+    config = _build_generate_content_config(types, media_resolution=media_resolution)
+
     try:
-        print("下载 YouTube 音频...", file=sys.stderr)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            audio_path = download_audio_from_youtube(youtube_url, temp_dir)
-            # 使用标准的音频转写函数
-            return transcribe_audio_streaming(
-                api_key=api_key,
-                audio_path=audio_path,
-                model_name=model_name,
-                language_hint=language_hint,
-                on_chunk=on_chunk
-            )
+        print("开始转写 YouTube（Gemini 直连）...", file=sys.stderr)
+        response_stream = client.models.generate_content_stream(
+            model=model_name,
+            contents=[full_prompt, video_part],
+            config=config,
+        )
+        transcript = _collect_stream_text(response_stream, on_chunk=on_chunk)
+        try:
+            print(f"转写完成（约 {len(transcript)} 字符）", file=sys.stderr)
+        except Exception:
+            pass
+        return transcript
     except Exception as e:
-        raise RuntimeError(f"YouTube 音频转写失败: {str(e)}") from e
+        raise RuntimeError(f"YouTube 直连转写失败: {str(e)}") from e
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def download_audio_from_youtube(
@@ -823,9 +1058,32 @@ def main() -> None:
         description="使用 Gemini 将音频转为文本（默认模型：gemini-2.5-flash）",
     )
     parser.add_argument(
+        "--auth-mode",
+        dest="auth_mode",
+        default=os.getenv("AUTH_MODE", AUTH_MODE_GEMINI_API_KEY),
+        choices=[AUTH_MODE_GEMINI_API_KEY, AUTH_MODE_VERTEX_AI_JSON],
+        help="认证方式：gemini_api_key（API Key）或 vertex_ai_json（Vertex AI service account JSON）",
+    )
+    parser.add_argument(
         "--api-key",
         dest="api_key",
-        help="Gemini API Key（也可使用环境变量 GOOGLE_API_KEY 或 GEMINI_API_KEY）",
+        help="Gemini API Key（仅在 auth-mode=gemini_api_key 时使用；也可用环境变量 GOOGLE_API_KEY / GEMINI_API_KEY）",
+    )
+    parser.add_argument(
+        "--vertex-json",
+        dest="vertex_json",
+        help="Vertex AI service account JSON 文件路径（仅在 auth-mode=vertex_ai_json 时使用）",
+    )
+    parser.add_argument(
+        "--vertex-project",
+        dest="vertex_project",
+        help="Vertex AI project id（可空，默认读取 JSON / GOOGLE_CLOUD_PROJECT）",
+    )
+    parser.add_argument(
+        "--vertex-location",
+        dest="vertex_location",
+        default=os.getenv("VERTEX_LOCATION", os.getenv("GOOGLE_CLOUD_LOCATION", "global")),
+        help="Vertex AI region，例如 us-central1（默认 global）",
     )
     src_group = parser.add_mutually_exclusive_group(required=True)
     src_group.add_argument(
@@ -836,7 +1094,7 @@ def main() -> None:
     src_group.add_argument(
         "--youtube",
         dest="youtube_url",
-        help="YouTube 视频链接（自动下载音频到 ./data 并转写）",
+        help="YouTube 视频链接（通过 Gemini 直连转写，仅支持公开视频）",
     )
     src_group.add_argument(
         "--video-url",
@@ -883,7 +1141,13 @@ def main() -> None:
     parser.add_argument(
         "--cookies",
         dest="cookies_path",
-        help="可选，yt-dlp cookies 文件路径（Netscape 格式）。仅对 --youtube 生效",
+        help="兼容旧参数；YouTube 直连模式不会使用 cookies",
+    )
+    parser.add_argument(
+        "--media-resolution",
+        dest="media_resolution",
+        default=os.getenv("GEMINI_MEDIA_RESOLUTION", "low"),
+        help="YouTube 直连时传给 Gemini 的媒体分辨率：low 或 high（默认 low）",
     )
     parser.add_argument(
         "--cleanup-hours",
@@ -907,31 +1171,34 @@ def main() -> None:
         os.makedirs(data_dir, exist_ok=True)
         start_cleanup_timer(data_dir, args.cleanup_hours)
 
-    # Resolve API key precedence: CLI > GOOGLE_API_KEY > GEMINI_API_KEY
-    api_key = (
-        args.api_key
-        or os.getenv("GOOGLE_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
+    auth_config = build_auth_config(
+        auth_mode=args.auth_mode,
+        api_key=args.api_key,
+        vertex_json=_read_text_file(args.vertex_json) if args.vertex_json else None,
+        vertex_project=args.vertex_project,
+        vertex_location=args.vertex_location,
     )
-    if not api_key:
+
+    if auth_config.auth_mode == AUTH_MODE_GEMINI_API_KEY and not auth_config.api_key:
         print(
             "缺少 API Key。请通过 --api-key 传入，或设置环境变量 GOOGLE_API_KEY / GEMINI_API_KEY。",
             file=sys.stderr,
         )
         sys.exit(2)
+    if auth_config.auth_mode == AUTH_MODE_VERTEX_AI_JSON and not auth_config.vertex_json:
+        print(
+            "缺少 Vertex AI service account JSON。请通过 --vertex-json 传入，或设置 GOOGLE_APPLICATION_CREDENTIALS / VERTEX_SERVICE_ACCOUNT_FILE。",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
-    # 解析音频来源
+    # 解析音频来源。YouTube 由 Gemini 直接读取 URL，不再下载为本地音频。
+    audio_path: Optional[str] = None
+    output_stem: Optional[str] = None
     if getattr(args, "youtube_url", None):
         data_dir = os.path.join(".", "data")
-        try:
-            audio_path = download_audio_from_youtube(
-                args.youtube_url,
-                output_dir=data_dir,
-                cookies_path=getattr(args, "cookies_path", None),
-            )
-        except Exception as e:
-            print(f"下载音频失败：{e}", file=sys.stderr)
-            sys.exit(1)
+        os.makedirs(data_dir, exist_ok=True)
+        output_stem = _youtube_output_stem(args.youtube_url)
     elif getattr(args, "video_url", None):
         data_dir = os.path.join(".", "data")
         try:
@@ -963,12 +1230,31 @@ def main() -> None:
 
     try:
         # Stream to stdout and capture full transcript
-        result = transcribe_audio_streaming(
-            api_key=api_key,
-            audio_path=audio_path,
-            model_name=args.model_name,
-            language_hint=args.language_hint,
-        )
+        if getattr(args, "youtube_url", None):
+            result = transcribe_youtube_url_streaming(
+                api_key=auth_config.api_key,
+                youtube_url=args.youtube_url,
+                model_name=args.model_name,
+                language_hint=args.language_hint,
+                auth_mode=auth_config.auth_mode,
+                vertex_json=auth_config.vertex_json,
+                vertex_project=auth_config.vertex_project,
+                vertex_location=auth_config.vertex_location,
+                media_resolution=args.media_resolution,
+            )
+        else:
+            if not audio_path:
+                raise RuntimeError("缺少音频文件路径")
+            result = transcribe_audio_streaming(
+                api_key=auth_config.api_key,
+                audio_path=audio_path,
+                model_name=args.model_name,
+                language_hint=args.language_hint,
+                auth_mode=auth_config.auth_mode,
+                vertex_json=auth_config.vertex_json,
+                vertex_project=auth_config.vertex_project,
+                vertex_location=auth_config.vertex_location,
+            )
     except Exception as e:
         print(f"\n转写失败：{e}", file=sys.stderr)
         sys.exit(1)
@@ -979,12 +1265,23 @@ def main() -> None:
     # Determine output path
     out_path = args.out_path
     if not out_path:
-        if getattr(args, "youtube_url", None) or getattr(args, "video_url", None) or getattr(args, "douyin_share_or_url", None):
+        if getattr(args, "youtube_url", None):
             data_dir = os.path.join(".", "data")
             os.makedirs(data_dir, exist_ok=True)
+            out_path = os.path.join(
+                data_dir,
+                f"{output_stem or _youtube_output_stem(args.youtube_url)}.txt",
+            )
+        elif getattr(args, "video_url", None) or getattr(args, "douyin_share_or_url", None):
+            data_dir = os.path.join(".", "data")
+            os.makedirs(data_dir, exist_ok=True)
+            if not audio_path:
+                raise RuntimeError("缺少音频文件路径")
             base_name = os.path.splitext(os.path.basename(audio_path))[0]
             out_path = os.path.join(data_dir, base_name + ".txt")
         else:
+            if not audio_path:
+                raise RuntimeError("缺少音频文件路径")
             base, _ = os.path.splitext(audio_path)
             out_path = base + ".txt"
 
@@ -1007,5 +1304,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

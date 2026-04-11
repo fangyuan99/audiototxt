@@ -1,4 +1,5 @@
 import asyncio
+from html import escape
 import logging
 import os
 import re
@@ -18,18 +19,15 @@ except Exception as exc:  # pragma: no cover - runtime guidance only
 try:
     from telegram import (
         BotCommand,
-        InlineKeyboardButton,
-        InlineKeyboardMarkup,
         MenuButtonCommands,
         Message,
         ReplyKeyboardRemove,
         Update,
     )
-    from telegram.constants import ChatAction
+    from telegram.constants import ChatAction, ParseMode
     from telegram.error import BadRequest
     from telegram.ext import (
         Application,
-        CallbackQueryHandler,
         CommandHandler,
         ContextTypes,
         MessageHandler,
@@ -88,13 +86,6 @@ MENU_SET_PROMPT = "设置 Prompt"
 MENU_RESET_PROMPT = "重置 Prompt"
 MENU_CANCEL = "取消当前输入"
 
-CALLBACK_AUTH_GEMINI = "auth:gemini"
-CALLBACK_AUTH_VERTEX = "auth:vertex"
-CALLBACK_SOURCE_AUDIO = "source:audio"
-CALLBACK_SOURCE_YOUTUBE = "source:youtube"
-CALLBACK_SOURCE_VIDEO_URL = "source:video_url"
-CALLBACK_SOURCE_DOUYIN = "source:douyin"
-
 AUTH_CHOICE_GEMINI = "使用 Gemini"
 AUTH_CHOICE_VERTEX = "使用 Vertex"
 
@@ -103,17 +94,9 @@ SOURCE_CHOICE_YOUTUBE = "YouTube 链接"
 SOURCE_CHOICE_VIDEO_URL = "视频直链"
 SOURCE_CHOICE_DOUYIN = "抖音分享"
 
-AUTH_CHOICE_BUTTONS = {
-    AUTH_CHOICE_GEMINI,
-    AUTH_CHOICE_VERTEX,
-}
+AUTH_CHOICE_BUTTONS = {AUTH_CHOICE_GEMINI, AUTH_CHOICE_VERTEX}
 
-SOURCE_CHOICE_BUTTONS = {
-    SOURCE_CHOICE_AUDIO,
-    SOURCE_CHOICE_YOUTUBE,
-    SOURCE_CHOICE_VIDEO_URL,
-    SOURCE_CHOICE_DOUYIN,
-}
+SOURCE_CHOICE_BUTTONS = {SOURCE_CHOICE_AUDIO, SOURCE_CHOICE_YOUTUBE, SOURCE_CHOICE_VIDEO_URL, SOURCE_CHOICE_DOUYIN}
 
 TEXT_INPUT_PENDING_ACTIONS = {
     "awaiting_secret",
@@ -173,64 +156,42 @@ def sanitize_name(value: str) -> str:
     return cleaned[:80] or f"transcript_{int(time.time())}"
 
 
+def html_code(value: str) -> str:
+    return f"<code>{escape(value)}</code>"
+
+
 def render_settings(settings: UserSettings) -> str:
     prompt_status = "默认内置 Prompt" if not settings.promoters else f"已自定义（{len(settings.promoters)} 字符）"
     auth_lines = [
-        f"- 认证方式: {settings.auth_mode}",
-        f"- API Key: {mask_api_key(settings.api_key)}",
+        f"- 认证方式: {html_code(settings.auth_mode)}",
+        f"- API Key: {html_code(mask_api_key(settings.api_key))}",
     ]
     if settings.auth_mode == AUTH_MODE_VERTEX_AI_JSON:
         auth_lines.extend(
             [
                 f"- Vertex JSON: {'已设置' if settings.vertex_json else '未设置'}",
-                f"- Vertex Project: {settings.vertex_project or '未设置'}",
-                f"- Vertex Location: {settings.vertex_location or DEFAULT_VERTEX_LOCATION}",
+                f"- Vertex Project: {html_code(settings.vertex_project or '未设置')}",
+                f"- Vertex Location: {html_code(settings.vertex_location or DEFAULT_VERTEX_LOCATION)}",
             ]
         )
     return (
-        "当前配置：\n"
+        "<b>当前配置：</b>\n"
         + "\n".join(auth_lines)
         + "\n"
-        f"- 模型: {settings.model_name}\n"
-        f"- 来源类型: {settings.source_type}\n"
-        f"- Promoters: {prompt_status}"
-    )
-
-
-def build_auth_inline_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(AUTH_CHOICE_GEMINI, callback_data=CALLBACK_AUTH_GEMINI),
-                InlineKeyboardButton(AUTH_CHOICE_VERTEX, callback_data=CALLBACK_AUTH_VERTEX),
-            ]
-        ]
-    )
-
-
-def build_source_inline_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(SOURCE_CHOICE_AUDIO, callback_data=CALLBACK_SOURCE_AUDIO),
-                InlineKeyboardButton(SOURCE_CHOICE_YOUTUBE, callback_data=CALLBACK_SOURCE_YOUTUBE),
-            ],
-            [
-                InlineKeyboardButton(SOURCE_CHOICE_VIDEO_URL, callback_data=CALLBACK_SOURCE_VIDEO_URL),
-                InlineKeyboardButton(SOURCE_CHOICE_DOUYIN, callback_data=CALLBACK_SOURCE_DOUYIN),
-            ],
-        ]
+        f"- 模型: {html_code(settings.model_name)}\n"
+        f"- 来源类型: {html_code(settings.source_type)}\n"
+        f"- Prompt: {escape(prompt_status)}"
     )
 
 
 def resolve_reply_markup(
     settings: Optional[UserSettings] = None,
     pending_action: Optional[str] = None,
-) -> InlineKeyboardMarkup | ReplyKeyboardRemove:
-    if pending_action == "set_auth_mode":
-        return build_auth_inline_keyboard()
-    if pending_action == "set_source_type":
-        return build_source_inline_keyboard()
+) -> ReplyKeyboardRemove:
+    return ReplyKeyboardRemove()
+
+
+def build_remove_keyboard_markup() -> ReplyKeyboardRemove:
     return ReplyKeyboardRemove()
 
 
@@ -243,27 +204,28 @@ async def reply_with_state(
 ) -> None:
     await message.reply_text(
         text,
+        parse_mode=ParseMode.HTML,
         reply_markup=resolve_reply_markup(settings=settings, pending_action=pending_action),
     )
 
 
 def build_help_text(settings: Optional[UserSettings] = None) -> str:
     lines = [
-        "使用方式：",
+        "<b>使用方式：</b>",
         "1. 优先用 Telegram 左下角菜单触发命令，不需要常驻底部键盘。",
-        "2. 点击 `/setauth` 后，我会在消息里弹出 Gemini / Vertex 选择按钮。",
+        f"2. 点击 {html_code('/setauth')} 后，按提示直接回复 {html_code('gemini')} 或 {html_code('vertex')}。",
         "3. 点击对应命令后继续发送 Gemini Key / Vertex JSON / Project / Location。",
-        "4. 点击 `/setmodel` 可直接发送新的模型名称，默认 `gemini-2.5-flash`。",
-        "5. 点击 `/setprompt` 可直接发送新的转写 Prompt。",
-        "6. 点击 `/setsource` 后，我会在消息里弹出 audio / youtube / video_url / douyin 选择按钮。",
+        f"4. 点击 {html_code('/setmodel')} 可直接发送新的模型名称，默认 {html_code('gemini-2.5-flash')}。",
+        f"5. 点击 {html_code('/setprompt')} 可直接发送新的转写 Prompt。",
+        f"6. 点击 {html_code('/setsource')} 后，按提示直接回复 {html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}。",
         "7. 配好后直接发送内容：",
-        "   - `audio`: 发送音频文件、语音或音频 document",
-        "   - `youtube`: 发送 YouTube 链接",
-        "   - `video_url`: 发送视频直链",
-        "   - `douyin`: 发送抖音分享文案或短链",
-        "8. 点击 `/settings` 查看当前保存的配置。",
-        "9. 点击 `/cancel` 可退出当前设置流程。",
-        "10. 旧的底部按钮文本如果还留在客户端里，继续点也仍然兼容。",
+        f"   - {html_code('audio')}: 发送音频文件、语音或音频 document",
+        f"   - {html_code('youtube')}: 发送 YouTube 链接",
+        f"   - {html_code('video_url')}: 发送视频直链",
+        f"   - {html_code('douyin')}: 发送抖音分享文案或短链",
+        f"8. 点击 {html_code('/settings')} 查看当前保存的配置。",
+        f"9. 点击 {html_code('/cancel')} 可退出当前设置流程。",
+        "10. 机器人只保留左下角命令菜单，不再显示右侧回复键盘菜单。",
     ]
     if settings is not None:
         lines.extend(["", render_settings(settings)])
@@ -433,7 +395,8 @@ async def setauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data[PENDING_ACTION_KEY] = "set_auth_mode"
         await reply_with_state(
             message,
-            "请选择认证方式。也可以直接发送 `/setauth gemini` 或 `/setauth vertex`。",
+            f"请直接回复认证方式：{html_code('gemini')} 或 {html_code('vertex')}。\n"
+            f"也可以直接发送 {html_code('/setauth gemini')} 或 {html_code('/setauth vertex')}。",
             settings=settings,
             pending_action="set_auth_mode",
         )
@@ -443,7 +406,8 @@ async def setauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if auth_mode is None:
         await reply_with_state(
             message,
-            "认证方式无效，请选择 Gemini 或 Vertex，或直接发送 `/setauth gemini` / `/setauth vertex`。",
+            f"认证方式无效，请回复 {html_code('gemini')} 或 {html_code('vertex')}，"
+            f"或直接发送 {html_code('/setauth gemini')} / {html_code('/setauth vertex')}。",
             settings=settings,
             pending_action="set_auth_mode",
         )
@@ -513,7 +477,7 @@ async def setvertexlocation_command(update: Update, context: ContextTypes.DEFAUL
         context.user_data[PENDING_ACTION_KEY] = "set_vertex_location"
         await reply_with_state(
             message,
-            "请直接发送 Vertex location，例如 `us-central1`。",
+            f"请直接发送 Vertex location，例如 {html_code('us-central1')}。",
             settings=settings,
             pending_action="set_vertex_location",
         )
@@ -536,7 +500,7 @@ async def setmodel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data[PENDING_ACTION_KEY] = "set_model_name"
         await reply_with_state(
             message,
-            "请直接发送新的模型名称，例如 `gemini-2.5-flash`。",
+            f"请直接发送新的模型名称，例如 {html_code('gemini-2.5-flash')}。",
             settings=settings,
             pending_action="set_model_name",
         )
@@ -598,7 +562,8 @@ async def setsource_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data[PENDING_ACTION_KEY] = "set_source_type"
         await reply_with_state(
             message,
-            "请选择来源类型。也可以直接发送 `/setsource audio` 等命令。",
+            f"请直接回复来源类型：{html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}。\n"
+            f"也可以直接发送 {html_code('/setsource audio')} 等命令。",
             settings=settings,
             pending_action="set_source_type",
         )
@@ -608,7 +573,8 @@ async def setsource_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if normalized not in SUPPORTED_SOURCE_TYPES:
         await reply_with_state(
             message,
-            "来源类型无效，请选择 audio / youtube / video_url / douyin，或直接发送 `/setsource audio` 等命令。",
+            f"来源类型无效，请回复 {html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}，"
+            f"或直接发送 {html_code('/setsource audio')} 等命令。",
             settings=settings,
             pending_action="set_source_type",
         )
@@ -720,7 +686,8 @@ async def handle_menu_action(
         context.user_data[PENDING_ACTION_KEY] = "set_auth_mode"
         await reply_with_state(
             message,
-            "请选择认证方式。也可以直接发送 `/setauth gemini` 或 `/setauth vertex`。",
+            f"请直接回复认证方式：{html_code('gemini')} 或 {html_code('vertex')}。\n"
+            f"也可以直接发送 {html_code('/setauth gemini')} 或 {html_code('/setauth vertex')}。",
             settings=settings,
             pending_action="set_auth_mode",
         )
@@ -760,7 +727,7 @@ async def handle_menu_action(
         context.user_data[PENDING_ACTION_KEY] = "set_vertex_location"
         await reply_with_state(
             message,
-            "请直接发送 Vertex location，例如 `us-central1`。",
+            f"请直接发送 Vertex location，例如 {html_code('us-central1')}。",
             settings=settings,
             pending_action="set_vertex_location",
         )
@@ -770,7 +737,7 @@ async def handle_menu_action(
         context.user_data[PENDING_ACTION_KEY] = "set_model_name"
         await reply_with_state(
             message,
-            "请直接发送新的模型名称，例如 `gemini-2.5-flash`。",
+            f"请直接发送新的模型名称，例如 {html_code('gemini-2.5-flash')}。",
             settings=settings,
             pending_action="set_model_name",
         )
@@ -780,7 +747,8 @@ async def handle_menu_action(
         context.user_data[PENDING_ACTION_KEY] = "set_source_type"
         await reply_with_state(
             message,
-            "请选择来源类型。也可以直接发送 `/setsource audio` 等命令。",
+            f"请直接回复来源类型：{html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}。\n"
+            f"也可以直接发送 {html_code('/setsource audio')} 等命令。",
             settings=settings,
             pending_action="set_source_type",
         )
@@ -807,54 +775,6 @@ async def handle_menu_action(
         return True
 
     return False
-
-
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user = update.effective_user
-    if query is None or user is None or query.message is None:
-        return
-
-    await query.answer()
-
-    store = context.application.bot_data["store"]
-    settings = store.get_user(user.id)
-    message = query.message
-    data = query.data or ""
-
-    if not settings.authorized:
-        context.user_data[PENDING_ACTION_KEY] = "awaiting_secret"
-        await reply_with_state(
-            message,
-            "请先发送 `/start` 并完成密码验证。",
-            settings=settings,
-            pending_action="awaiting_secret",
-        )
-        return
-
-    if data == CALLBACK_AUTH_GEMINI:
-        await apply_auth_mode_selection(message, context, settings, AUTH_MODE_GEMINI_API_KEY)
-        return
-
-    if data == CALLBACK_AUTH_VERTEX:
-        await apply_auth_mode_selection(message, context, settings, AUTH_MODE_VERTEX_AI_JSON)
-        return
-
-    if data == CALLBACK_SOURCE_AUDIO:
-        await apply_source_type_selection(message, context, settings, "audio")
-        return
-
-    if data == CALLBACK_SOURCE_YOUTUBE:
-        await apply_source_type_selection(message, context, settings, "youtube")
-        return
-
-    if data == CALLBACK_SOURCE_VIDEO_URL:
-        await apply_source_type_selection(message, context, settings, "video_url")
-        return
-
-    if data == CALLBACK_SOURCE_DOUYIN:
-        await apply_source_type_selection(message, context, settings, "douyin")
-        return
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -885,7 +805,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if auth_mode is None:
             await reply_with_state(
                 message,
-                "认证方式无效，请选择 Gemini 或 Vertex，或直接发送 `/setauth gemini` / `/setauth vertex`。",
+                f"认证方式无效，请回复 {html_code('gemini')} 或 {html_code('vertex')}，"
+                f"或直接发送 {html_code('/setauth gemini')} / {html_code('/setauth vertex')}。",
                 settings=settings,
                 pending_action="set_auth_mode",
             )
@@ -907,7 +828,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if source_type is None:
             await reply_with_state(
                 message,
-                "来源类型无效，请选择 audio / youtube / video_url / douyin，或直接发送 `/setsource audio` 等命令。",
+                f"来源类型无效，请回复 {html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}，"
+                f"或直接发送 {html_code('/setsource audio')} 等命令。",
                 settings=settings,
                 pending_action="set_source_type",
             )
@@ -942,7 +864,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await reply_with_state(
             message,
             "验证成功。\n\n"
-            "先从左下角菜单点 `/setauth` 选择认证方式；后续设置也都从菜单触发。\n\n"
+            f"先从左下角菜单点 {html_code('/setauth')} 选择认证方式；后续设置也都从菜单触发。\n\n"
             + build_help_text(settings),
             settings=settings,
             pending_action="set_auth_mode",
@@ -970,7 +892,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if auth_mode is None:
             await reply_with_state(
                 message,
-                "认证方式无效，请选择 Gemini 或 Vertex，或直接发送 `/setauth gemini` / `/setauth vertex`。",
+                f"认证方式无效，请回复 {html_code('gemini')} 或 {html_code('vertex')}，"
+                f"或直接发送 {html_code('/setauth gemini')} / {html_code('/setauth vertex')}。",
                 settings=settings,
                 pending_action="set_auth_mode",
             )
@@ -1017,7 +940,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if normalized not in SUPPORTED_SOURCE_TYPES:
             await reply_with_state(
                 message,
-                "来源类型无效，请选择 audio / youtube / video_url / douyin，或直接发送 `/setsource audio` 等命令。",
+                f"来源类型无效，请回复 {html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}，"
+                f"或直接发送 {html_code('/setsource audio')} 等命令。",
                 settings=settings,
                 pending_action="set_source_type",
             )
@@ -1053,7 +977,7 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if settings.source_type != "audio":
         await reply_with_state(
             message,
-            f"当前保存的来源类型是 `{settings.source_type}`，请先点击“设置来源类型”并切换到 `audio` 再发送音频。",
+            f"当前保存的来源类型是 {html_code(settings.source_type)}，请先点击“设置来源类型”并切换到 {html_code('audio')} 再发送音频。",
             settings=settings,
         )
         return
@@ -1151,7 +1075,7 @@ def execute_transcription(
         raise RuntimeError("缺少文本输入。")
 
     if source_type == "youtube":
-        on_status("开始处理 YouTube 链接")
+        on_status("开始转写（YouTube 直连）")
         transcript = transcribe_youtube_url_streaming(
             api_key=auth_config.api_key,
             youtube_url=text_input,
@@ -1375,7 +1299,6 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("setprompt", setpromoters_command))
     application.add_handler(CommandHandler("resetpromoters", resetpromoters_command))
     application.add_handler(CommandHandler("resetprompt", resetpromoters_command))
-    application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(
         MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.AUDIO, handle_audio_message)
     )
