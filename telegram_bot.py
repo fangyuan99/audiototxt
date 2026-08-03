@@ -1,61 +1,83 @@
+from __future__ import annotations
+
 import asyncio
-from html import escape
+import hmac
+import json
 import logging
 import os
-import re
-import tempfile
+import threading
 import time
-from dataclasses import dataclass
+import traceback
+import uuid
+from collections import OrderedDict
+from dataclasses import replace
+from html import escape
+from inspect import iscoroutinefunction
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-try:
-    from dotenv import load_dotenv
-except Exception as exc:  # pragma: no cover - runtime guidance only
-    raise RuntimeError(
-        "缺少 python-dotenv 依赖，请先执行 `pip install -r requirements.txt`。"
-    ) from exc
-
-try:
-    from telegram import (
-        BotCommand,
-        MenuButtonCommands,
-        Message,
-        ReplyKeyboardRemove,
-        Update,
-    )
-    from telegram.constants import ChatAction, ParseMode
-    from telegram.error import BadRequest
-    from telegram.ext import (
-        Application,
-        CommandHandler,
-        ContextTypes,
-        MessageHandler,
-        filters,
-    )
-except Exception as exc:  # pragma: no cover - runtime guidance only
-    raise RuntimeError(
-        "缺少 python-telegram-bot 依赖，请先执行 `pip install -r requirements.txt`。"
-    ) from exc
-
-from bot_state import (
-    BotStateStore,
-    DEFAULT_AUTH_MODE,
-    DEFAULT_VERTEX_LOCATION,
-    SUPPORTED_SOURCE_TYPES,
-    UserSettings,
-    mask_api_key,
+from dotenv import load_dotenv
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+    Message,
+    Update,
 )
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from bot_state import BotStateStore, parse_user_ids
+from channel_health import (
+    ChannelHealthResult,
+    ErrorDiagnosis,
+    check_current_channel,
+    diagnose_exception,
+    sanitize_error_detail,
+)
+from key_pool import GeminiKeyPool, KeyPoolExhausted, KeyStatus, mask_key
 from main import (
     AUTH_MODE_GEMINI_API_KEY,
     AUTH_MODE_VERTEX_AI_JSON,
-    _extract_first_url,
     build_auth_config,
-    download_audio_from_direct_url,
-    download_video_and_extract_audio,
-    fetch_douyin_mp3_via_tiksave,
-    transcribe_audio_streaming,
-    transcribe_youtube_url_streaming,
+    build_genai_client,
+)
+from media_policy import (
+    DownloadLimitExceeded,
+    MediaPolicy,
+    UnsafeUrlError,
+    detect_text_source,
+    extract_first_url,
+    sanitize_upload_name,
+)
+from retention import (
+    cleanup_expired_media,
+    cleanup_expired_outputs,
+    run_legacy_media_cleanup,
+)
+from service_config import (
+    BotPaths,
+    GlobalConfigStore,
+    GlobalSettings,
+    migrate_legacy_user_settings,
+    parse_api_keys,
+)
+from telegram_jobs import JobStore, TelegramJob, TelegramJobManager
+from transcription_service import (
+    TaskCancelled,
+    TaskDeadline,
+    TranscriptionRequest,
+    TranscriptionResult,
+    TranscriptionService,
 )
 
 
@@ -63,718 +85,1114 @@ ROOT_DIR = Path(__file__).resolve().parent
 load_dotenv(ROOT_DIR / ".env")
 logger = logging.getLogger(__name__)
 
-DATA_DIR = ROOT_DIR / "data" / "telegram_bot"
-UPLOAD_DIR = DATA_DIR / "uploads"
-OUTPUT_DIR = DATA_DIR / "outputs"
-STATE_FILE = Path(os.getenv("BOT_STATE_FILE", str(DATA_DIR / "state.json")))
-MAX_MESSAGE_LENGTH = 3800
-STREAM_EDIT_INTERVAL_SECONDS = 1.0
-STREAM_MIN_BUFFER = 80
 PENDING_ACTION_KEY = "pending_action"
+PENDING_AMBIGUOUS_KEY = "pending_ambiguous"
+MODEL_CHOICES_KEY = "model_choices"
+MAX_TELEGRAM_TEXT = 3800
+SHORT_TRANSCRIPT_LIMIT = 3200
+TRANSCRIPT_PREVIEW_LIMIT = 700
+MODEL_PAGE_SIZE = 6
 
-MENU_START = "开始使用"
-MENU_HELP = "帮助"
-MENU_SETTINGS = "当前配置"
-MENU_SET_AUTH = "设置认证方式"
-MENU_SET_KEY = "设置 Gemini Key"
-MENU_SET_VERTEX_JSON = "设置 Vertex JSON"
-MENU_SET_VERTEX_PROJECT = "设置 Vertex Project"
-MENU_SET_VERTEX_LOCATION = "设置 Vertex Location"
-MENU_SET_MODEL = "设置模型"
-MENU_SET_SOURCE = "设置来源类型"
-MENU_SET_PROMPT = "设置 Prompt"
-MENU_RESET_PROMPT = "重置 Prompt"
-MENU_CANCEL = "取消当前输入"
-
-AUTH_CHOICE_GEMINI = "使用 Gemini"
-AUTH_CHOICE_VERTEX = "使用 Vertex"
-
-SOURCE_CHOICE_AUDIO = "音频文件"
-SOURCE_CHOICE_YOUTUBE = "YouTube 链接"
-SOURCE_CHOICE_VIDEO_URL = "视频直链"
-SOURCE_CHOICE_DOUYIN = "抖音分享"
-
-AUTH_CHOICE_BUTTONS = {AUTH_CHOICE_GEMINI, AUTH_CHOICE_VERTEX}
-
-SOURCE_CHOICE_BUTTONS = {SOURCE_CHOICE_AUDIO, SOURCE_CHOICE_YOUTUBE, SOURCE_CHOICE_VIDEO_URL, SOURCE_CHOICE_DOUYIN}
-
-TEXT_INPUT_PENDING_ACTIONS = {
-    "awaiting_secret",
-    "set_api_key",
-    "set_vertex_json",
-    "set_vertex_project",
-    "set_vertex_location",
-    "set_model_name",
-    "set_promoters",
-}
-
-MENU_BUTTONS = {
-    MENU_START,
-    MENU_HELP,
-    MENU_SETTINGS,
-    MENU_SET_AUTH,
-    MENU_SET_KEY,
-    MENU_SET_VERTEX_JSON,
-    MENU_SET_VERTEX_PROJECT,
-    MENU_SET_VERTEX_LOCATION,
-    MENU_SET_MODEL,
-    MENU_SET_SOURCE,
-    MENU_SET_PROMPT,
-    MENU_RESET_PROMPT,
-    MENU_CANCEL,
+STAGE_LABELS = {
+    "queued": "排队",
+    "preparing": "准备任务",
+    "parsing": "解析来源",
+    "downloading": "下载媒体",
+    "extracting": "抽取音频",
+    "retrying": "临时失败后重试",
+    "transcribing": "Gemini / Vertex 转写",
+    "delivering": "发送结果",
+    "completed": "已完成",
 }
 
 BOT_COMMANDS = [
-    BotCommand("start", "开始使用并完成验证"),
-    BotCommand("help", "查看使用说明"),
-    BotCommand("settings", "查看当前配置"),
-    BotCommand("setauth", "设置认证方式"),
-    BotCommand("setkey", "设置 Gemini API Key"),
-    BotCommand("setvertexjson", "设置 Vertex JSON"),
-    BotCommand("setvertexproject", "设置 Vertex Project"),
-    BotCommand("setvertexlocation", "设置 Vertex Location"),
-    BotCommand("setmodel", "设置模型"),
-    BotCommand("setsource", "设置来源类型"),
-    BotCommand("setprompt", "设置 Prompt"),
-    BotCommand("resetprompt", "重置 Prompt"),
-    BotCommand("cancel", "取消当前输入"),
+    BotCommand("start", "开始使用 / 返回首页"),
+    BotCommand("settings", "管理全局设置"),
+    BotCommand("help", "查看使用帮助"),
+    BotCommand("cancel", "取消当前任务或输入"),
 ]
 
 
-@dataclass
-class TranscriptionResult:
-    transcript: str
-    output_path: Path
-
-
-def make_store() -> BotStateStore:
-    return BotStateStore(str(STATE_FILE))
-
-
-def sanitize_name(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
-    return cleaned[:80] or f"transcript_{int(time.time())}"
-
-
 def html_code(value: str) -> str:
-    return f"<code>{escape(value)}</code>"
+    return f"<code>{escape(str(value))}</code>"
 
 
-def render_settings(settings: UserSettings) -> str:
-    prompt_status = "默认内置 Prompt" if not settings.promoters else f"已自定义（{len(settings.promoters)} 字符）"
-    auth_lines = [
-        f"- 认证方式: {html_code(settings.auth_mode)}",
-        f"- API Key: {html_code(mask_api_key(settings.api_key))}",
+class ResultCache:
+    def __init__(
+        self,
+        *,
+        max_entries: int = 64,
+        max_characters: int = 2_000_000,
+        ttl_seconds: float = 24 * 3600,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.max_entries = max(1, int(max_entries))
+        self.max_characters = max(1, int(max_characters))
+        self.ttl_seconds = max(0.1, float(ttl_seconds))
+        self.clock = clock
+        self._items: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._characters = 0
+        self._lock = threading.RLock()
+
+    def _evict_locked(self) -> None:
+        now = self.clock()
+        for key, (expires_at, value) in list(self._items.items()):
+            if expires_at > now:
+                continue
+            self._items.pop(key, None)
+            self._characters -= len(value)
+        while self._items and (
+            len(self._items) > self.max_entries
+            or self._characters > self.max_characters
+        ):
+            _key, (_expires, value) = self._items.popitem(last=False)
+            self._characters -= len(value)
+
+    def put(self, key: str, value: str) -> None:
+        text = value or ""
+        with self._lock:
+            previous = self._items.pop(key, None)
+            if previous is not None:
+                self._characters -= len(previous[1])
+            if len(text) > self.max_characters:
+                text = text[: self.max_characters]
+            self._items[key] = (self.clock() + self.ttl_seconds, text)
+            self._characters += len(text)
+            self._evict_locked()
+
+    def get(self, key: str) -> Optional[str]:
+        with self._lock:
+            self._evict_locked()
+            item = self._items.get(key)
+            if item is None:
+                return None
+            self._items.move_to_end(key)
+            return item[1]
+
+    def evict(self) -> None:
+        with self._lock:
+            self._evict_locked()
+
+
+def build_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📊 当前状态", callback_data="home:status"),
+                InlineKeyboardButton("⚙️ 全局设置", callback_data="settings"),
+            ],
+            [
+                InlineKeyboardButton("📋 任务队列", callback_data="queue"),
+                InlineKeyboardButton("❓ 使用帮助", callback_data="help"),
+            ],
+        ]
+    )
+
+
+def build_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔑 Gemini Keys", callback_data="settings:keys")],
+            [
+                InlineKeyboardButton("🤖 模型", callback_data="settings:model"),
+                InlineKeyboardButton("🌐 语言", callback_data="settings:language"),
+            ],
+            [InlineKeyboardButton("🩺 测试当前渠道", callback_data="channel:test")],
+            [InlineKeyboardButton("📝 Prompt", callback_data="settings:prompt")],
+            [InlineKeyboardButton("☁️ Vertex 高级设置", callback_data="settings:vertex")],
+            [InlineKeyboardButton("⬅️ 返回首页", callback_data="home")],
+        ]
+    )
+
+
+def build_key_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("替换全部", callback_data="keys:replace"),
+                InlineKeyboardButton("追加 Key", callback_data="keys:append"),
+            ],
+            [InlineKeyboardButton("⬅️ 返回设置", callback_data="settings")],
+        ]
+    )
+
+
+def build_model_keyboard(
+    models: list[str],
+    *,
+    page: int = 0,
+    page_size: int = MODEL_PAGE_SIZE,
+) -> InlineKeyboardMarkup:
+    page_size = max(1, page_size)
+    page_count = max(1, (len(models) + page_size - 1) // page_size)
+    page = min(max(0, page), page_count - 1)
+    start = page * page_size
+    rows = [
+        [
+            InlineKeyboardButton(
+                model.removeprefix("models/")[:48],
+                callback_data=f"model:set:{index}",
+            )
+        ]
+        for index, model in enumerate(models[start : start + page_size], start=start)
+    ]
+    navigation = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton("⬅️ 上一页", callback_data=f"model:page:{page - 1}")
+        )
+    if page + 1 < page_count:
+        navigation.append(
+            InlineKeyboardButton("下一页 ➡️", callback_data=f"model:page:{page + 1}")
+        )
+    if navigation:
+        rows.append(navigation)
+    rows.extend(
+        [
+            [InlineKeyboardButton("手动输入模型名", callback_data="model:manual")],
+            [InlineKeyboardButton("⬅️ 返回设置", callback_data="settings")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("追加要求", callback_data="prompt:append"),
+                InlineKeyboardButton("完整覆盖（高级）", callback_data="prompt:override"),
+            ],
+            [InlineKeyboardButton("恢复默认", callback_data="prompt:reset")],
+            [InlineKeyboardButton("⬅️ 返回设置", callback_data="settings")],
+        ]
+    )
+
+
+def build_language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("自动识别原语言", callback_data="language:auto")],
+            [InlineKeyboardButton("手动设置提示", callback_data="language:manual")],
+            [InlineKeyboardButton("⬅️ 返回设置", callback_data="settings")],
+        ]
+    )
+
+
+def build_vertex_keyboard(settings: GlobalSettings) -> InlineKeyboardMarkup:
+    mode_button = (
+        InlineKeyboardButton("切换到 Gemini", callback_data="auth:gemini")
+        if settings.auth_mode == AUTH_MODE_VERTEX_AI_JSON
+        else InlineKeyboardButton("切换到 Vertex", callback_data="auth:vertex")
+    )
+    return InlineKeyboardMarkup(
+        [
+            [mode_button],
+            [InlineKeyboardButton("设置 Service Account JSON", callback_data="vertex:json")],
+            [
+                InlineKeyboardButton("设置 Project", callback_data="vertex:project"),
+                InlineKeyboardButton("设置 Location", callback_data="vertex:location"),
+            ],
+            [InlineKeyboardButton("⬅️ 返回设置", callback_data="settings")],
+        ]
+    )
+
+
+def build_source_choice_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("YouTube", callback_data=f"source:youtube:{token}"),
+                InlineKeyboardButton("视频直链", callback_data=f"source:video_url:{token}"),
+            ],
+            [InlineKeyboardButton("抖音分享", callback_data=f"source:douyin:{token}")],
+            [InlineKeyboardButton("取消", callback_data="input:cancel")],
+        ]
+    )
+
+
+def build_cancel_job_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("取消任务", callback_data=f"job:cancel:{job_id}")]]
+    )
+
+
+def build_failed_job_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("重试任务", callback_data=f"job:retry:{job_id}")],
+            [
+                InlineKeyboardButton("打开设置", callback_data="settings"),
+                InlineKeyboardButton("返回首页", callback_data="home"),
+            ],
+        ]
+    )
+
+
+def build_result_keyboard(job_id: str, *, include_full: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if include_full:
+        rows.append(
+            [InlineKeyboardButton("发送完整文本", callback_data=f"result:full:{job_id}")]
+        )
+    rows.append([InlineKeyboardButton("返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def render_settings(
+    settings: GlobalSettings,
+    key_statuses: Optional[list[KeyStatus]] = None,
+) -> str:
+    statuses = key_statuses or []
+    key_lines = []
+    if statuses:
+        icon = {"healthy": "✅", "cooldown": "⏳", "disabled": "❌"}
+        for index, status in enumerate(statuses, start=1):
+            suffix = ""
+            if status.state == "cooldown":
+                suffix = f"（{status.retry_after_seconds}s 后重试）"
+            elif status.state == "disabled":
+                suffix = "（已停用，更新配置后恢复）"
+            key_lines.append(
+                f"  {index}. {icon.get(status.state, '•')} {html_code(status.masked_key)}{suffix}"
+            )
+    else:
+        key_lines = [
+            f"  {index}. {html_code(mask_key(key))}"
+            for index, key in enumerate(settings.gemini_api_keys, start=1)
+        ]
+    if not key_lines:
+        key_lines.append("  未配置")
+
+    if settings.prompt_override:
+        prompt_status = f"完整覆盖（{len(settings.prompt_override)} 字符）"
+    elif settings.prompt_append:
+        prompt_status = f"附加要求（{len(settings.prompt_append)} 字符）"
+    else:
+        prompt_status = "默认忠实逐字稿"
+
+    auth_label = "Vertex AI" if settings.auth_mode == AUTH_MODE_VERTEX_AI_JSON else "Gemini API Key"
+    lines = [
+        "<b>全局设置</b>",
+        f"认证方式：{escape(auth_label)}",
+        f"Gemini Key：{len(settings.gemini_api_keys)} 个",
+        *key_lines,
+        f"模型：{html_code(settings.model_name)}",
+        f"语言：{html_code(settings.language_hint or '自动识别原语言')}",
+        f"Prompt：{escape(prompt_status)}",
     ]
     if settings.auth_mode == AUTH_MODE_VERTEX_AI_JSON:
-        auth_lines.extend(
+        lines.extend(
             [
-                f"- Vertex JSON: {'已设置' if settings.vertex_json else '未设置'}",
-                f"- Vertex Project: {html_code(settings.vertex_project or '未设置')}",
-                f"- Vertex Location: {html_code(settings.vertex_location or DEFAULT_VERTEX_LOCATION)}",
+                f"Vertex JSON：{'已设置' if settings.vertex_json else '未设置'}",
+                f"Vertex Project：{html_code(settings.vertex_project or '未设置')}",
+                f"Vertex Location：{html_code(settings.vertex_location or 'global')}",
             ]
         )
-    return (
-        "<b>当前配置：</b>\n"
-        + "\n".join(auth_lines)
-        + "\n"
-        f"- 模型: {html_code(settings.model_name)}\n"
-        f"- 来源类型: {html_code(settings.source_type)}\n"
-        f"- Prompt: {escape(prompt_status)}"
+    return "\n".join(lines)
+
+
+def render_channel_health(
+    result: ChannelHealthResult,
+    settings: Optional[GlobalSettings] = None,
+) -> str:
+    auth_label = (
+        "Vertex AI"
+        if result.auth_mode == AUTH_MODE_VERTEX_AI_JSON
+        else "Gemini API Key"
     )
-
-
-def resolve_reply_markup(
-    settings: Optional[UserSettings] = None,
-    pending_action: Optional[str] = None,
-) -> ReplyKeyboardRemove:
-    return ReplyKeyboardRemove()
-
-
-def build_remove_keyboard_markup() -> ReplyKeyboardRemove:
-    return ReplyKeyboardRemove()
-
-
-async def reply_with_state(
-    message: Message,
-    text: str,
-    *,
-    settings: Optional[UserSettings] = None,
-    pending_action: Optional[str] = None,
-) -> None:
-    await message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=resolve_reply_markup(settings=settings, pending_action=pending_action),
-    )
-
-
-def build_help_text(settings: Optional[UserSettings] = None) -> str:
+    state = "✅ 当前渠道可用" if result.available else "❌ 当前渠道不可用"
     lines = [
-        "<b>使用方式：</b>",
-        "1. 优先用 Telegram 左下角菜单触发命令，不需要常驻底部键盘。",
-        f"2. 点击 {html_code('/setauth')} 后，按提示直接回复 {html_code('gemini')} 或 {html_code('vertex')}。",
-        "3. 点击对应命令后继续发送 Gemini Key / Vertex JSON / Project / Location。",
-        f"4. 点击 {html_code('/setmodel')} 可直接发送新的模型名称，默认 {html_code('gemini-2.5-flash')}。",
-        f"5. 点击 {html_code('/setprompt')} 可直接发送新的转写 Prompt。",
-        f"6. 点击 {html_code('/setsource')} 后，按提示直接回复 {html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}。",
-        "7. 配好后直接发送内容：",
-        f"   - {html_code('audio')}: 发送音频文件、语音或音频 document",
-        f"   - {html_code('youtube')}: 发送 YouTube 链接",
-        f"   - {html_code('video_url')}: 发送视频直链",
-        f"   - {html_code('douyin')}: 发送抖音分享文案或短链",
-        f"8. 点击 {html_code('/settings')} 查看当前保存的配置。",
-        f"9. 点击 {html_code('/cancel')} 可退出当前设置流程。",
-        "10. 机器人只保留左下角命令菜单，不再显示右侧回复键盘菜单。",
+        f"<b>{state}</b>",
+        f"渠道：{escape(auth_label)}",
+        f"测活模型：{html_code(result.model)}",
+    ]
+    if result.location:
+        lines.append(f"地区：{html_code(result.location)}")
+    lines.extend(
+        [
+            f"耗时：{result.latency_ms} ms",
+            f"结果：{escape(result.user_message)}",
+        ]
+    )
+    if settings is not None and settings.model_name != result.model:
+        lines.append(f"当前转写模型：{html_code(settings.model_name)}（本次未测试）")
+    return "\n".join(lines)
+
+
+def render_job_failure(stage: str, reason: str) -> str:
+    label = STAGE_LABELS.get(stage, stage or "未知阶段")
+    return (
+        "<b>任务失败</b>\n"
+        f"失败阶段：{escape(label)}\n"
+        f"原因：{escape(reason or '任务执行失败。')}"
+    )
+
+
+def build_help_text(settings: Optional[GlobalSettings] = None) -> str:
+    lines = [
+        "<b>使用方法</b>",
+        "直接发送以下任一内容，机器人会自动识别并排队转写：",
+        "• 音频文件、语音或音频文档",
+        "• YouTube 链接",
+        "• 抖音分享文案或链接",
+        "• 公网视频/音频直链",
+        "",
+        f"用 {html_code('/settings')} 管理全局 Key、模型和 Prompt。",
+        f"用 {html_code('/cancel')} 取消自己的最近任务。",
+        "机器人仅支持私聊，默认输出忠实逐字稿，不自动翻译或总结。",
     ]
     if settings is not None:
         lines.extend(["", render_settings(settings)])
     return "\n".join(lines)
 
 
-def parse_auth_mode(value: str) -> Optional[str]:
-    normalized = value.strip().lower().replace("-", "_")
-    aliases = {
-        "gemini": AUTH_MODE_GEMINI_API_KEY,
-        "api_key": AUTH_MODE_GEMINI_API_KEY,
-        "gemini_api_key": AUTH_MODE_GEMINI_API_KEY,
-        "gemini api key": AUTH_MODE_GEMINI_API_KEY,
-        "使用 gemini": AUTH_MODE_GEMINI_API_KEY,
-        "vertex": AUTH_MODE_VERTEX_AI_JSON,
-        "vertex_ai": AUTH_MODE_VERTEX_AI_JSON,
-        "vertex_json": AUTH_MODE_VERTEX_AI_JSON,
-        "vertex_ai_json": AUTH_MODE_VERTEX_AI_JSON,
-        "vertex ai json": AUTH_MODE_VERTEX_AI_JSON,
-        "使用 vertex": AUTH_MODE_VERTEX_AI_JSON,
-    }
-    return aliases.get(normalized)
+def safe_error_message(exc: BaseException) -> str:
+    if isinstance(exc, JobExecutionFailure):
+        return exc.user_message
+    if isinstance(exc, KeyPoolExhausted):
+        return "当前没有可用的 Gemini Key，请打开设置检查 Key 池。"
+    if isinstance(exc, UnsafeUrlError):
+        return "链接不安全或不是公网地址，已拒绝处理。"
+    if isinstance(exc, DownloadLimitExceeded):
+        return "媒体文件超过服务端大小限制。"
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return "任务处理超时，请稍后重试。"
+    if isinstance(exc, TaskCancelled):
+        return "任务已取消。"
+    message = str(exc).lower()
+    if "api key" in message and any(token in message for token in ("invalid", "not valid")):
+        return "Gemini Key 无效，请在全局设置中更换。"
+    if "quota" in message or "resource exhausted" in message:
+        return "当前 Key 额度不足，已尝试切换其它 Key。"
+    return "任务执行失败，请重试；如持续失败，请打开设置检查配置。"
 
 
-def parse_source_type(value: str) -> Optional[str]:
-    normalized = value.strip().lower().replace("-", "_")
-    aliases = {
-        "audio": "audio",
-        "音频": "audio",
-        "音频文件": "audio",
-        "youtube": "youtube",
-        "youtube 链接": "youtube",
-        "video_url": "video_url",
-        "video url": "video_url",
-        "视频直链": "video_url",
-        "douyin": "douyin",
-        "抖音": "douyin",
-        "抖音分享": "douyin",
-    }
-    return aliases.get(normalized)
+class JobExecutionFailure(RuntimeError):
+    def __init__(self, stage: str, diagnosis: ErrorDiagnosis) -> None:
+        super().__init__(diagnosis.user_message)
+        self.stage = stage
+        self.error_code = diagnosis.code
+        self.user_message = diagnosis.user_message
+        self.diagnosis = diagnosis
 
 
-async def safe_edit_text(message: Message, text: str) -> None:
-    try:
-        await message.edit_text(text)
-    except BadRequest as exc:
-        if "message is not modified" in str(exc).lower():
-            return
-        raise
+def _is_private(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and getattr(chat, "type", "private") == "private"
 
 
-async def ensure_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[UserSettings]:
+def _is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
-    if user is None or update.effective_message is None:
-        return None
-
-    store = context.application.bot_data["store"]
-    settings = store.get_user(user.id)
-    if settings.authorized:
-        return settings
-
-    context.user_data[PENDING_ACTION_KEY] = "awaiting_secret"
-    await reply_with_state(
-        update.effective_message,
-        "请先发送机器人密码完成首次验证。",
-        settings=settings,
-        pending_action="awaiting_secret",
+    if user is None:
+        return False
+    store: BotStateStore = context.application.bot_data["store"]
+    return store.is_user_authorized(
+        user.id,
+        current_secret=context.application.bot_data.get("bot_secret", ""),
+        allowed_user_ids=context.application.bot_data.get("allowed_user_ids", set()),
     )
-    return None
+
+
+async def _reply_html(
+    message: Message,
+    text: str,
+    *,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> Message:
+    return await message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+
+
+async def _show_home(message: Message) -> Message:
+    return await _reply_html(
+        message,
+        "<b>AudioToTxt 已就绪</b>\n\n直接发送音频、YouTube、抖音分享或视频直链即可。",
+        reply_markup=build_home_keyboard(),
+    )
+
+
+async def _prompt_for_password(message: Message, context) -> None:
+    context.user_data[PENDING_ACTION_KEY] = "awaiting_secret"
+    await _reply_html(message, "请发送机器人密码完成验证。")
+
+
+async def ensure_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.effective_message
+    if message is None:
+        return False
+    if not _is_private(update):
+        await message.reply_text("此机器人仅支持私聊。")
+        return False
+    if _is_authorized(update, context):
+        return True
+    await _prompt_for_password(message, context)
+    return False
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    user = update.effective_user
-    if message is None or user is None:
+    if message is None:
         return
-
-    store = context.application.bot_data["store"]
-    settings = store.get_user(user.id)
-    if settings.authorized:
-        await reply_with_state(
-            message,
-            "机器人已就绪。\n\n" + build_help_text(settings),
-            settings=settings,
-        )
+    if not _is_private(update):
+        await message.reply_text("此机器人仅支持私聊。")
         return
+    if not _is_authorized(update, context):
+        await _prompt_for_password(message, context)
+        return
+    context.user_data.pop(PENDING_ACTION_KEY, None)
+    await _show_home(message)
 
-    context.user_data[PENDING_ACTION_KEY] = "awaiting_secret"
-    await reply_with_state(
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or not await ensure_authorized(update, context):
+        return
+    settings: GlobalSettings = context.application.bot_data["config_store"].get()
+    pool: GeminiKeyPool = context.application.bot_data["key_pool"]
+    pool.sync(settings.gemini_api_keys)
+    await _reply_html(
         message,
-        "欢迎使用 AudioToTxt Telegram 机器人。\n"
-        "首次使用请先发送密码完成验证。\n"
-        "验证通过后，请从 Telegram 左下角菜单继续触发配置命令。",
-        settings=settings,
-        pending_action="awaiting_secret",
+        render_settings(settings, pool.statuses()),
+        reply_markup=build_settings_keyboard(),
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    user = update.effective_user
-    if message is None or user is None:
+    if message is None or not await ensure_authorized(update, context):
         return
-
-    store = context.application.bot_data["store"]
-    settings = store.get_user(user.id)
-    if not settings.authorized:
-        await reply_with_state(message, "请先点击“开始使用”并发送密码完成验证。", settings=settings)
-        return
-    await reply_with_state(message, build_help_text(settings), settings=settings)
+    await _reply_html(message, build_help_text(), reply_markup=build_home_keyboard())
 
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
-        return
-    await reply_with_state(message, render_settings(settings), settings=settings)
+def _latest_user_job(manager: TelegramJobManager, user_id: int) -> Optional[TelegramJob]:
+    candidates = [
+        job
+        for job in manager.snapshot()
+        if job.user_id == user_id and job.status in {"queued", "running", "cancelling"}
+    ]
+    return candidates[-1] if candidates else None
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
+    if message is None or user is None or not await ensure_authorized(update, context):
+        return
+    context.user_data.pop(PENDING_ACTION_KEY, None)
+    context.user_data.pop(PENDING_AMBIGUOUS_KEY, None)
+    manager: TelegramJobManager = context.application.bot_data["job_manager"]
+    job = _latest_user_job(manager, user.id)
+    if job is None:
+        await _reply_html(message, "当前没有可取消的任务或输入流程。")
+        return
+    manager.cancel(job.job_id)
+    await _reply_html(message, f"已请求取消任务 {html_code(job.job_id[:8])}。")
+
+
+def _validate_api_key(api_key: str) -> bool:
+    config = build_auth_config(auth_mode=AUTH_MODE_GEMINI_API_KEY, api_key=api_key)
+    client = build_genai_client(config, timeout_seconds=15)
+    try:
+        iterator = iter(client.models.list(config={"page_size": 1}))
+        next(iterator, None)
+        return True
+    finally:
+        client.close()
+
+
+def _list_models_for_key(api_key: str) -> list[str]:
+    config = build_auth_config(auth_mode=AUTH_MODE_GEMINI_API_KEY, api_key=api_key)
+    client = build_genai_client(config, timeout_seconds=20)
+    try:
+        result = []
+        for model in client.models.list(config={"page_size": 100}):
+            actions = [str(item).lower() for item in (getattr(model, "supported_actions", None) or [])]
+            if actions and not any("generatecontent" in action for action in actions):
+                continue
+            name = str(getattr(model, "name", "") or "").strip()
+            if name:
+                result.append(name)
+        return result
+    finally:
+        client.close()
+
+
+async def _run_channel_health_check(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    settings_override: Optional[GlobalSettings] = None,
+) -> ChannelHealthResult:
+    settings = settings_override or context.application.bot_data["config_store"].get()
+    pool: GeminiKeyPool = context.application.bot_data["key_pool"]
+    checker = context.application.bot_data.get(
+        "channel_health_checker", check_current_channel
+    )
+    try:
+        if iscoroutinefunction(checker):
+            result = await checker(settings, pool)
+        else:
+            result = await asyncio.to_thread(checker, settings, pool)
+    except Exception as exc:
+        diagnosis = diagnose_exception(exc)
+        result = ChannelHealthResult(
+            available=False,
+            auth_mode=settings.auth_mode,
+            model="gemini-2.5-flash-lite",
+            location=(
+                settings.vertex_location or "global"
+                if settings.auth_mode == AUTH_MODE_VERTEX_AI_JSON
+                else ""
+            ),
+            latency_ms=0,
+            code=diagnosis.code,
+            user_message=diagnosis.user_message,
+            error_type=diagnosis.error_type,
+            log_detail=diagnosis.log_detail,
+        )
+    log = logger.info if result.available else logger.warning
+    log(
+        "channel_health auth_mode=%s model=%s location=%s available=%s "
+        "category=%s latency_ms=%s error_type=%s detail=%s",
+        result.auth_mode,
+        result.model,
+        result.location or "-",
+        result.available,
+        result.code,
+        result.latency_ms,
+        result.error_type or "-",
+        result.log_detail or "-",
+    )
+    return result
+
+
+async def _report_channel_health(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    settings_override: Optional[GlobalSettings] = None,
+) -> ChannelHealthResult:
+    progress = await _reply_html(
+        message,
+        "<b>正在测试渠道</b>\n使用 gemini-2.5-flash-lite 发送 hi……",
+    )
+    settings = settings_override or context.application.bot_data["config_store"].get()
+    result = await _run_channel_health_check(
+        context, settings_override=settings_override
+    )
+    rendered = render_channel_health(result, settings)
+    try:
+        await progress.edit_text(
+            rendered,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_settings_keyboard(),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.debug("Unable to edit channel health progress message.")
+        await _reply_html(
+            message,
+            rendered,
+            reply_markup=build_settings_keyboard(),
+        )
+    return result
+
+
+async def _edit_query(query, text: str, markup: InlineKeyboardMarkup) -> None:
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+def _queue_text(manager: TelegramJobManager, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    jobs = [
+        job
+        for job in manager.snapshot()
+        if job.user_id == user_id
+        and job.status in {"queued", "running", "cancelling", "failed", "interrupted"}
+    ][-10:]
+    if not jobs:
+        return "<b>任务队列</b>\n当前没有任务。", build_home_keyboard()
+    labels = {
+        "queued": "排队中",
+        "running": "执行中",
+        "cancelling": "取消中",
+        "failed": "失败",
+        "interrupted": "已中断",
+    }
+    lines = ["<b>最近任务</b>"]
+    rows = []
+    for job in jobs:
+        position = manager.queue_position(job.job_id)
+        suffix = f"（第 {position} 位）" if position else ""
+        lines.append(
+            f"• {html_code(job.job_id[:8])} · {escape(labels.get(job.status, job.status))}{suffix} · {html_code(job.source_type)}"
+        )
+        if job.status in {"queued", "running", "cancelling"}:
+            rows.append(
+                [InlineKeyboardButton(f"取消 {job.job_id[:8]}", callback_data=f"job:cancel:{job.job_id}")]
+            )
+        elif job.status in {"failed", "interrupted"}:
+            rows.append(
+                [InlineKeyboardButton(f"重试 {job.job_id[:8]}", callback_data=f"job:retry:{job.job_id}")]
+            )
+    rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="home")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or query.message is None or user is None:
+        return
+    await query.answer()
+    if not _is_private(update):
+        await query.message.reply_text("此机器人仅支持私聊。")
+        return
+    if not _is_authorized(update, context):
+        await _prompt_for_password(query.message, context)
+        return
+
+    data = query.data or ""
+    config_store: GlobalConfigStore = context.application.bot_data["config_store"]
+    key_pool: GeminiKeyPool = context.application.bot_data["key_pool"]
+    manager: TelegramJobManager = context.application.bot_data["job_manager"]
+
+    if data in {"home", "home:status"}:
+        text = "<b>AudioToTxt 已就绪</b>\n\n直接发送内容即可。"
+        if data == "home:status":
+            active = len(
+                [job for job in manager.snapshot() if job.status in {"queued", "running", "cancelling"}]
+            )
+            settings = config_store.get()
+            text += f"\n\n全局活动任务：{active}\n已配置 Key：{len(settings.gemini_api_keys)}"
+        await _edit_query(query, text, build_home_keyboard())
+        return
+    if data == "help":
+        await _edit_query(query, build_help_text(), build_home_keyboard())
+        return
+    if data == "settings":
+        settings = config_store.get()
+        key_pool.sync(settings.gemini_api_keys)
+        await _edit_query(
+            query,
+            render_settings(settings, key_pool.statuses()),
+            build_settings_keyboard(),
+        )
+        return
+    if data == "channel:test":
+        settings = config_store.get()
+        await _edit_query(
+            query,
+            "<b>正在测试当前渠道</b>\n使用 gemini-2.5-flash-lite 发送 hi……",
+            build_settings_keyboard(),
+        )
+        result = await _run_channel_health_check(context)
+        await _edit_query(
+            query,
+            render_channel_health(result, settings),
+            build_settings_keyboard(),
+        )
+        return
+    if data == "queue":
+        text, markup = _queue_text(manager, user.id)
+        await _edit_query(query, text, markup)
+        return
+    if data == "settings:keys":
+        settings = config_store.get()
+        key_pool.sync(settings.gemini_api_keys)
+        await _edit_query(
+            query,
+            render_settings(settings, key_pool.statuses()),
+            build_key_keyboard(),
+        )
+        return
+    if data in {"keys:replace", "keys:append"}:
+        context.user_data[PENDING_ACTION_KEY] = data.replace(":", "_")
+        await query.message.reply_text(
+            "请发送逗号分隔的 Gemini API Key。该消息会在收到后立即删除。"
+        )
+        return
+    if data == "settings:model":
+        settings = config_store.get()
+        if settings.auth_mode == AUTH_MODE_VERTEX_AI_JSON:
+            context.user_data[PENDING_ACTION_KEY] = "model_manual"
+            await query.message.reply_text("Vertex 模式请直接发送模型名称。")
+            return
+        key_pool.sync(settings.gemini_api_keys)
+        try:
+            models = await asyncio.to_thread(
+                key_pool.list_models,
+                context.application.bot_data.get("model_loader", _list_models_for_key),
+            )
+        except Exception:
+            models = []
+        context.user_data[MODEL_CHOICES_KEY] = models
+        if not models:
+            context.user_data[PENDING_ACTION_KEY] = "model_manual"
+            await query.message.reply_text("无法读取模型列表，请直接发送模型名称。")
+            return
+        await _edit_query(
+            query,
+            f"<b>选择模型</b>\n当前：{html_code(settings.model_name)}",
+            build_model_keyboard(models),
+        )
+        return
+    if data.startswith("model:page:"):
+        models = context.user_data.get(MODEL_CHOICES_KEY, [])
+        page = int(data.rsplit(":", 1)[-1])
+        await _edit_query(query, "<b>选择模型</b>", build_model_keyboard(models, page=page))
+        return
+    if data.startswith("model:set:"):
+        models = context.user_data.get(MODEL_CHOICES_KEY, [])
+        index = int(data.rsplit(":", 1)[-1])
+        if index < 0 or index >= len(models):
+            await query.message.reply_text("模型列表已过期，请重新打开设置。")
+            return
+        config_store.update(model_name=models[index])
+        await _edit_query(query, f"模型已更新为 {html_code(models[index])}。", build_settings_keyboard())
+        return
+    if data == "model:manual":
+        context.user_data[PENDING_ACTION_KEY] = "model_manual"
+        await query.message.reply_text("请发送完整模型名称。")
+        return
+    if data == "settings:prompt":
+        await _edit_query(
+            query,
+            "<b>Prompt 设置</b>\n默认规则始终保持忠实逐字稿；建议使用“追加要求”。",
+            build_prompt_keyboard(),
+        )
+        return
+    if data in {"prompt:append", "prompt:override"}:
+        context.user_data[PENDING_ACTION_KEY] = data.replace(":", "_")
+        await query.message.reply_text("请发送新的 Prompt 内容。")
+        return
+    if data == "prompt:reset":
+        config_store.update(prompt_append="", prompt_override="")
+        await _edit_query(query, "Prompt 已恢复为默认忠实逐字稿。", build_settings_keyboard())
+        return
+    if data == "settings:language":
+        await _edit_query(query, "<b>语言设置</b>", build_language_keyboard())
+        return
+    if data == "language:auto":
+        config_store.update(language_hint="")
+        await _edit_query(query, "已改为自动识别并按原语言转写。", build_settings_keyboard())
+        return
+    if data == "language:manual":
+        context.user_data[PENDING_ACTION_KEY] = "language_manual"
+        await query.message.reply_text("请发送语言提示，例如 zh、en、ja 或 yue。")
+        return
+    if data == "settings:vertex":
+        settings = config_store.get()
+        await _edit_query(
+            query,
+            render_settings(settings, key_pool.statuses()),
+            build_vertex_keyboard(settings),
+        )
+        return
+    if data == "auth:gemini":
+        config_store.update(auth_mode=AUTH_MODE_GEMINI_API_KEY)
+        await _edit_query(query, "已切换到 Gemini Key 模式。", build_settings_keyboard())
+        return
+    if data == "auth:vertex":
+        config_store.update(auth_mode=AUTH_MODE_VERTEX_AI_JSON)
+        await _edit_query(query, "已切换到 Vertex AI 模式。", build_settings_keyboard())
+        return
+    if data.startswith("vertex:"):
+        action = data.split(":", 1)[1]
+        context.user_data[PENDING_ACTION_KEY] = f"vertex_{action}"
+        prompts = {
+            "json": "请发送完整 Service Account JSON；消息会立即删除。",
+            "project": "请发送 Vertex Project ID。",
+            "location": "请发送 Vertex Location，例如 global。",
+        }
+        await query.message.reply_text(prompts.get(action, "请发送新值。"))
+        return
+    if data == "input:cancel":
+        context.user_data.pop(PENDING_ACTION_KEY, None)
+        context.user_data.pop(PENDING_AMBIGUOUS_KEY, None)
+        await _edit_query(query, "已取消输入。", build_home_keyboard())
+        return
+    if data.startswith("source:"):
+        _prefix, source_type, token = data.split(":", 2)
+        pending = context.user_data.get(PENDING_AMBIGUOUS_KEY) or {}
+        if pending.get("token") != token:
+            await query.message.reply_text("这条选择已过期，请重新发送内容。")
+            return
+        context.user_data.pop(PENDING_AMBIGUOUS_KEY, None)
+        await _enqueue_text(
+            query.message,
+            context,
+            user.id,
+            source_type,
+            pending.get("text", ""),
+        )
+        return
+    if data.startswith("job:cancel:"):
+        job_id = data.split(":", 2)[-1]
+        job = manager.get(job_id)
+        if job is None or job.user_id != user.id:
+            await query.message.reply_text("任务不存在或无权操作。")
+            return
+        manager.cancel(job_id)
+        await query.message.reply_text(f"已请求取消任务 {job_id[:8]}。")
+        return
+    if data.startswith("job:retry:"):
+        job_id = data.split(":", 2)[-1]
+        job = manager.get(job_id)
+        if job is None or job.user_id != user.id:
+            await query.message.reply_text("任务不存在或无权操作。")
+            return
+        try:
+            detected_source = (
+                detect_text_source(job.text_input) if job.text_input else None
+            )
+            retried = manager.retry(
+                job_id,
+                source_type_override=detected_source or job.source_type,
+            )
+        except (ValueError, KeyError) as exc:
+            await query.message.reply_text(str(exc))
+            return
+        await query.message.reply_text(
+            f"任务已重新排队：{retried.job_id[:8]}，当前第 {manager.queue_position(retried.job_id)} 位。"
+        )
+        return
+    if data.startswith("result:full:"):
+        job_id = data.split(":", 2)[-1]
+        job = manager.get(job_id)
+        if job is None or job.user_id != user.id:
+            await query.message.reply_text("结果不存在或无权访问。")
+            return
+        cache: ResultCache = context.application.bot_data["result_cache"]
+        transcript = cache.get(job_id)
+        if transcript is None:
+            await query.message.reply_text("结果已过期，请重新转写。")
+            return
+        for start in range(0, len(transcript), MAX_TELEGRAM_TEXT):
+            await context.bot.send_message(
+                chat_id=job.chat_id,
+                text=transcript[start : start + MAX_TELEGRAM_TEXT],
+            )
+        return
+
+
+async def _handle_password(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
     if message is None or user is None:
         return
-    store = context.application.bot_data["store"]
-    settings = store.get_user(user.id)
-    context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(message, "已取消当前输入流程。", settings=settings)
-
-
-def _read_command_value(context: ContextTypes.DEFAULT_TYPE) -> str:
-    return " ".join(context.args).strip()
-
-
-async def setkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
+    secret = context.application.bot_data.get("bot_secret", "")
+    try:
+        await message.delete()
+    except Exception:
+        logger.debug("Unable to delete the password message.")
+    if not secret:
+        await _reply_html(message, "服务端未配置机器人密码。")
         return
-
-    value = _read_command_value(context)
-    if not value:
-        context.user_data[PENDING_ACTION_KEY] = "set_api_key"
-        await reply_with_state(
-            message,
-            "请直接发送新的 Gemini API Key。",
-            settings=settings,
-            pending_action="set_api_key",
-        )
+    if not hmac.compare_digest(text, secret):
+        await _reply_html(message, "密码不正确，请重试。")
         return
-
-    store = context.application.bot_data["store"]
-    settings = store.upsert_user(settings.user_id, auth_mode=AUTH_MODE_GEMINI_API_KEY, api_key=value)
-    context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(message, "API Key 已保存。\n\n" + render_settings(settings), settings=settings)
-
-
-async def setauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
-        return
-
-    value = _read_command_value(context)
-    if not value:
-        context.user_data[PENDING_ACTION_KEY] = "set_auth_mode"
-        await reply_with_state(
-            message,
-            f"请直接回复认证方式：{html_code('gemini')} 或 {html_code('vertex')}。\n"
-            f"也可以直接发送 {html_code('/setauth gemini')} 或 {html_code('/setauth vertex')}。",
-            settings=settings,
-            pending_action="set_auth_mode",
-        )
-        return
-
-    auth_mode = parse_auth_mode(value)
-    if auth_mode is None:
-        await reply_with_state(
-            message,
-            f"认证方式无效，请回复 {html_code('gemini')} 或 {html_code('vertex')}，"
-            f"或直接发送 {html_code('/setauth gemini')} / {html_code('/setauth vertex')}。",
-            settings=settings,
-            pending_action="set_auth_mode",
-        )
-        return
-
-    await apply_auth_mode_selection(message, context, settings, auth_mode)
-
-
-async def setvertexjson_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
-        return
-
-    value = _read_command_value(context)
-    if not value:
-        context.user_data[PENDING_ACTION_KEY] = "set_vertex_json"
-        await reply_with_state(
-            message,
-            "请直接发送完整的 Vertex AI service account JSON。",
-            settings=settings,
-            pending_action="set_vertex_json",
-        )
-        return
-
-    store = context.application.bot_data["store"]
-    settings = store.upsert_user(
-        settings.user_id,
-        auth_mode=AUTH_MODE_VERTEX_AI_JSON,
-        vertex_json=value,
+    store: BotStateStore = context.application.bot_data["store"]
+    store.authorize_user(
+        user.id,
+        username=getattr(user, "username", "") or "",
+        first_name=getattr(user, "first_name", "") or "",
+        secret=secret,
     )
     context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(message, "Vertex AI JSON 已保存。\n\n" + render_settings(settings), settings=settings)
-
-
-async def setvertexproject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
-        return
-
-    value = _read_command_value(context)
-    if not value:
-        context.user_data[PENDING_ACTION_KEY] = "set_vertex_project"
-        await reply_with_state(
-            message,
-            "请直接发送 Vertex project ID。",
-            settings=settings,
-            pending_action="set_vertex_project",
-        )
-        return
-
-    store = context.application.bot_data["store"]
-    settings = store.upsert_user(settings.user_id, vertex_project=value.strip())
-    context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(message, "Vertex project 已保存。\n\n" + render_settings(settings), settings=settings)
-
-
-async def setvertexlocation_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
-        return
-
-    value = _read_command_value(context)
-    if not value:
-        context.user_data[PENDING_ACTION_KEY] = "set_vertex_location"
-        await reply_with_state(
-            message,
-            f"请直接发送 Vertex location，例如 {html_code('us-central1')}。",
-            settings=settings,
-            pending_action="set_vertex_location",
-        )
-        return
-
-    store = context.application.bot_data["store"]
-    settings = store.upsert_user(settings.user_id, vertex_location=value.strip())
-    context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(message, "Vertex location 已保存。\n\n" + render_settings(settings), settings=settings)
-
-
-async def setmodel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
-        return
-
-    value = _read_command_value(context)
-    if not value:
-        context.user_data[PENDING_ACTION_KEY] = "set_model_name"
-        await reply_with_state(
-            message,
-            f"请直接发送新的模型名称，例如 {html_code('gemini-2.5-flash')}。",
-            settings=settings,
-            pending_action="set_model_name",
-        )
-        return
-
-    store = context.application.bot_data["store"]
-    settings = store.upsert_user(settings.user_id, model_name=value)
-    context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(message, "模型已保存。\n\n" + render_settings(settings), settings=settings)
-
-
-async def setpromoters_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
-        return
-
-    value = _read_command_value(context)
-    if not value:
-        context.user_data[PENDING_ACTION_KEY] = "set_promoters"
-        await reply_with_state(
-            message,
-            "请直接发送新的 Prompt 文案。需要恢复默认可点击“重置 Prompt”。",
-            settings=settings,
-            pending_action="set_promoters",
-        )
-        return
-
-    store = context.application.bot_data["store"]
-    settings = store.upsert_user(settings.user_id, promoters=value)
-    context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(message, "Prompt 已保存。\n\n" + render_settings(settings), settings=settings)
-
-
-async def resetpromoters_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
-        return
-
-    store = context.application.bot_data["store"]
-    settings = store.upsert_user(settings.user_id, promoters="")
-    context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(
+    await _reply_html(
         message,
-        "Prompt 已重置为默认内置内容。\n\n" + render_settings(settings),
-        settings=settings,
+        "验证成功。现在可以直接发送音频或链接。",
+        reply_markup=build_home_keyboard(),
     )
 
 
-async def setsource_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
-        return
-
-    value = _read_command_value(context)
-    if not value:
-        context.user_data[PENDING_ACTION_KEY] = "set_source_type"
-        await reply_with_state(
-            message,
-            f"请直接回复来源类型：{html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}。\n"
-            f"也可以直接发送 {html_code('/setsource audio')} 等命令。",
-            settings=settings,
-            pending_action="set_source_type",
-        )
-        return
-
-    normalized = parse_source_type(value)
-    if normalized not in SUPPORTED_SOURCE_TYPES:
-        await reply_with_state(
-            message,
-            f"来源类型无效，请回复 {html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}，"
-            f"或直接发送 {html_code('/setsource audio')} 等命令。",
-            settings=settings,
-            pending_action="set_source_type",
-        )
-        return
-
-    await apply_source_type_selection(message, context, settings, normalized)
-
-
-async def apply_auth_mode_selection(
-    message: Message,
+async def _handle_setting_input(
+    update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    settings: UserSettings,
-    auth_mode: str,
-) -> None:
-    store = context.application.bot_data["store"]
-    settings = store.upsert_user(settings.user_id, auth_mode=auth_mode)
-    next_action = None
-    next_tip = ""
-    if auth_mode == AUTH_MODE_GEMINI_API_KEY and not settings.api_key:
-        next_action = "set_api_key"
-        context.user_data[PENDING_ACTION_KEY] = next_action
-        next_tip = "\n\n下一步请直接发送 Gemini API Key。"
-    elif auth_mode == AUTH_MODE_VERTEX_AI_JSON and not settings.vertex_json:
-        next_action = "set_vertex_json"
-        context.user_data[PENDING_ACTION_KEY] = next_action
-        next_tip = "\n\n下一步请直接发送 Vertex AI JSON。"
-    else:
-        context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(
-        message,
-        "认证方式已保存。\n\n" + render_settings(settings) + next_tip,
-        settings=settings,
-        pending_action=next_action,
-    )
-
-
-async def apply_source_type_selection(
-    message: Message,
-    context: ContextTypes.DEFAULT_TYPE,
-    settings: UserSettings,
-    source_type: str,
-) -> None:
-    store = context.application.bot_data["store"]
-    settings = store.upsert_user(settings.user_id, source_type=source_type)
-    context.user_data.pop(PENDING_ACTION_KEY, None)
-    await reply_with_state(message, "来源类型已保存。\n\n" + render_settings(settings), settings=settings)
-
-
-async def handle_menu_action(
-    message: Message,
-    context: ContextTypes.DEFAULT_TYPE,
-    settings: UserSettings,
+    action: str,
     text: str,
 ) -> bool:
-    if text not in MENU_BUTTONS:
+    message = update.effective_message
+    if message is None:
+        return True
+    store: GlobalConfigStore = context.application.bot_data["config_store"]
+    pool: GeminiKeyPool = context.application.bot_data["key_pool"]
+    vertex_health_settings: Optional[GlobalSettings] = None
+
+    if action in {"keys_replace", "keys_append"}:
+        try:
+            await message.delete()
+        except Exception:
+            logger.debug("Unable to delete a Gemini key message.")
+        keys = parse_api_keys(text)
+        if not keys:
+            await _reply_html(message, "没有检测到有效格式的 Key，旧配置保持不变。")
+            return True
+        validator = context.application.bot_data.get("key_validator", _validate_api_key)
+        valid = []
+        invalid_count = 0
+        for key in keys:
+            try:
+                is_valid = await asyncio.to_thread(validator, key)
+            except Exception:
+                is_valid = False
+            if is_valid:
+                valid.append(key)
+            else:
+                invalid_count += 1
+        if not valid:
+            await _reply_html(message, "新 Key 全部验证失败，旧配置保持不变。")
+            return True
+        settings = (
+            store.replace_api_keys(valid)
+            if action == "keys_replace"
+            else store.append_api_keys(valid)
+        )
+        pool.sync(settings.gemini_api_keys)
+        context.user_data.pop(PENDING_ACTION_KEY, None)
+        await _reply_html(
+            message,
+            f"Key 池已更新：{len(settings.gemini_api_keys)} 个可配置 Key；本次忽略 {invalid_count} 个失败项。",
+            reply_markup=build_settings_keyboard(),
+        )
+        return True
+    if action == "model_manual":
+        store.update(model_name=text.strip())
+    elif action == "prompt_append":
+        store.update(prompt_append=text, prompt_override="")
+    elif action == "prompt_override":
+        store.update(prompt_override=text)
+    elif action == "language_manual":
+        store.update(language_hint=text.strip())
+    elif action == "vertex_json":
+        try:
+            await message.delete()
+        except Exception:
+            logger.debug("Unable to delete a Vertex credential message.")
+        try:
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise ValueError
+        except Exception:
+            await _reply_html(message, "Vertex JSON 格式无效，旧配置保持不变。")
+            return True
+        current = store.get()
+        project = str(parsed.get("project_id") or current.vertex_project).strip()
+        saved = store.update(
+            vertex_json=json.dumps(parsed, ensure_ascii=False),
+            vertex_project=project,
+            vertex_location=current.vertex_location.strip() or "global",
+            auth_mode=AUTH_MODE_VERTEX_AI_JSON,
+        )
+        vertex_health_settings = replace(
+            saved,
+            auth_mode=AUTH_MODE_VERTEX_AI_JSON,
+            vertex_location=saved.vertex_location or "global",
+        )
+    elif action == "vertex_project":
+        saved = store.update(vertex_project=text.strip())
+        vertex_health_settings = replace(
+            saved,
+            auth_mode=AUTH_MODE_VERTEX_AI_JSON,
+            vertex_location=saved.vertex_location or "global",
+        )
+    elif action == "vertex_location":
+        saved = store.update(vertex_location=text.strip() or "global")
+        vertex_health_settings = replace(
+            saved,
+            auth_mode=AUTH_MODE_VERTEX_AI_JSON,
+            vertex_location=saved.vertex_location or "global",
+        )
+    else:
         return False
 
     context.user_data.pop(PENDING_ACTION_KEY, None)
-
-    if text == MENU_START:
-        if settings.authorized:
-            await reply_with_state(
-                message,
-                "机器人已就绪。\n\n" + build_help_text(settings),
-                settings=settings,
-            )
-            return True
-        context.user_data[PENDING_ACTION_KEY] = "awaiting_secret"
-        await reply_with_state(
+    if vertex_health_settings is not None:
+        await _report_channel_health(
             message,
-            "欢迎使用 AudioToTxt Telegram 机器人。\n"
-            "首次使用请先发送密码完成验证。\n"
-            "验证通过后，请从 Telegram 左下角菜单继续触发配置命令。",
-            settings=settings,
-            pending_action="awaiting_secret",
+            context,
+            settings_override=vertex_health_settings,
         )
-        return True
-
-    if text == MENU_HELP:
-        if settings.authorized:
-            await reply_with_state(message, build_help_text(settings), settings=settings)
-        else:
-            await reply_with_state(
-                message,
-                "请先点击“开始使用”并发送密码完成验证。",
-                settings=settings,
-            )
-        return True
-
-    if text == MENU_CANCEL:
-        await reply_with_state(message, "已取消当前输入流程。", settings=settings)
-        return True
-
-    if not settings.authorized:
-        context.user_data[PENDING_ACTION_KEY] = "awaiting_secret"
-        await reply_with_state(
+    else:
+        await _reply_html(
             message,
-            "请先点击“开始使用”并发送密码完成验证。",
-            settings=settings,
-            pending_action="awaiting_secret",
+            "全局设置已保存。",
+            reply_markup=build_settings_keyboard(),
         )
-        return True
+    return True
 
-    if text == MENU_SETTINGS:
-        await reply_with_state(message, render_settings(settings), settings=settings)
-        return True
 
-    if text == MENU_SET_AUTH:
-        context.user_data[PENDING_ACTION_KEY] = "set_auth_mode"
-        await reply_with_state(
-            message,
-            f"请直接回复认证方式：{html_code('gemini')} 或 {html_code('vertex')}。\n"
-            f"也可以直接发送 {html_code('/setauth gemini')} 或 {html_code('/setauth vertex')}。",
-            settings=settings,
-            pending_action="set_auth_mode",
+async def _enqueue_text(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    source_type: str,
+    text: str,
+) -> TelegramJob:
+    value = text
+    if source_type in {"youtube", "video_url"}:
+        value = extract_first_url(text) or text
+    return await _enqueue_job(
+        message,
+        context,
+        user_id=user_id,
+        source_type=source_type,
+        text_input=value,
+    )
+
+
+async def _enqueue_job(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    source_type: str,
+    text_input: str = "",
+    audio_path: str = "",
+    original_filename: str = "",
+) -> TelegramJob:
+    status_message = await _reply_html(message, "<b>已接收</b>\n正在加入任务队列……")
+    manager: TelegramJobManager = context.application.bot_data["job_manager"]
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    if chat_id is None:
+        chat_id = getattr(message, "chat_id", user_id)
+    job = manager.enqueue(
+        user_id=user_id,
+        chat_id=chat_id,
+        source_type=source_type,
+        text_input=text_input,
+        audio_path=audio_path,
+        original_filename=original_filename,
+        source_message_id=getattr(message, "message_id", 0) or 0,
+        status_message_id=getattr(status_message, "message_id", 0) or 0,
+    )
+    position = manager.queue_position(job.job_id)
+    try:
+        await status_message.edit_text(
+            f"<b>排队中</b>\n任务：{html_code(job.job_id[:8])}\n当前位置：{position}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_cancel_job_keyboard(job.job_id),
         )
-        return True
-
-    if text == MENU_SET_KEY:
-        context.user_data[PENDING_ACTION_KEY] = "set_api_key"
-        await reply_with_state(
-            message,
-            "请直接发送新的 Gemini API Key。",
-            settings=settings,
-            pending_action="set_api_key",
-        )
-        return True
-
-    if text == MENU_SET_VERTEX_JSON:
-        context.user_data[PENDING_ACTION_KEY] = "set_vertex_json"
-        await reply_with_state(
-            message,
-            "请直接发送完整的 Vertex AI service account JSON。",
-            settings=settings,
-            pending_action="set_vertex_json",
-        )
-        return True
-
-    if text == MENU_SET_VERTEX_PROJECT:
-        context.user_data[PENDING_ACTION_KEY] = "set_vertex_project"
-        await reply_with_state(
-            message,
-            "请直接发送 Vertex project ID。",
-            settings=settings,
-            pending_action="set_vertex_project",
-        )
-        return True
-
-    if text == MENU_SET_VERTEX_LOCATION:
-        context.user_data[PENDING_ACTION_KEY] = "set_vertex_location"
-        await reply_with_state(
-            message,
-            f"请直接发送 Vertex location，例如 {html_code('us-central1')}。",
-            settings=settings,
-            pending_action="set_vertex_location",
-        )
-        return True
-
-    if text == MENU_SET_MODEL:
-        context.user_data[PENDING_ACTION_KEY] = "set_model_name"
-        await reply_with_state(
-            message,
-            f"请直接发送新的模型名称，例如 {html_code('gemini-2.5-flash')}。",
-            settings=settings,
-            pending_action="set_model_name",
-        )
-        return True
-
-    if text == MENU_SET_SOURCE:
-        context.user_data[PENDING_ACTION_KEY] = "set_source_type"
-        await reply_with_state(
-            message,
-            f"请直接回复来源类型：{html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}。\n"
-            f"也可以直接发送 {html_code('/setsource audio')} 等命令。",
-            settings=settings,
-            pending_action="set_source_type",
-        )
-        return True
-
-    if text == MENU_SET_PROMPT:
-        context.user_data[PENDING_ACTION_KEY] = "set_promoters"
-        await reply_with_state(
-            message,
-            "请直接发送新的 Prompt 文案。需要恢复默认可点击“重置 Prompt”。",
-            settings=settings,
-            pending_action="set_promoters",
-        )
-        return True
-
-    if text == MENU_RESET_PROMPT:
-        store = context.application.bot_data["store"]
-        updated_settings = store.upsert_user(settings.user_id, promoters="")
-        await reply_with_state(
-            message,
-            "Prompt 已重置为默认内置内容。\n\n" + render_settings(updated_settings),
-            settings=updated_settings,
-        )
-        return True
-
-    return False
+    except Exception:
+        logger.debug("Unable to edit the initial queue status card.")
+    return job
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -782,528 +1200,320 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     if message is None or user is None or message.text is None:
         return
-
-    store = context.application.bot_data["store"]
-    settings = store.get_user(user.id)
-    pending_action = context.user_data.get(PENDING_ACTION_KEY)
+    if not _is_private(update):
+        await message.reply_text("此机器人仅支持私聊。")
+        return
     text = message.text.strip()
-
-    if await handle_menu_action(message, context, settings, text):
+    action = context.user_data.get(PENDING_ACTION_KEY)
+    if action == "awaiting_secret":
+        await _handle_password(update, context, text)
+        return
+    if not _is_authorized(update, context):
+        await _prompt_for_password(message, context)
+        return
+    if action and await _handle_setting_input(update, context, action, text):
         return
 
-    if text in AUTH_CHOICE_BUTTONS:
-        if not settings.authorized:
-            context.user_data[PENDING_ACTION_KEY] = "awaiting_secret"
-            await reply_with_state(
-                message,
-                "请先点击“开始使用”并发送密码完成验证。",
-                settings=settings,
-                pending_action="awaiting_secret",
-            )
-            return
-        auth_mode = parse_auth_mode(text)
-        if auth_mode is None:
-            await reply_with_state(
-                message,
-                f"认证方式无效，请回复 {html_code('gemini')} 或 {html_code('vertex')}，"
-                f"或直接发送 {html_code('/setauth gemini')} / {html_code('/setauth vertex')}。",
-                settings=settings,
-                pending_action="set_auth_mode",
-            )
-            return
-        await apply_auth_mode_selection(message, context, settings, auth_mode)
-        return
-
-    if text in SOURCE_CHOICE_BUTTONS:
-        if not settings.authorized:
-            context.user_data[PENDING_ACTION_KEY] = "awaiting_secret"
-            await reply_with_state(
-                message,
-                "请先点击“开始使用”并发送密码完成验证。",
-                settings=settings,
-                pending_action="awaiting_secret",
-            )
-            return
-        source_type = parse_source_type(text)
-        if source_type is None:
-            await reply_with_state(
-                message,
-                f"来源类型无效，请回复 {html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}，"
-                f"或直接发送 {html_code('/setsource audio')} 等命令。",
-                settings=settings,
-                pending_action="set_source_type",
-            )
-            return
-        await apply_source_type_selection(message, context, settings, source_type)
-        return
-
-    if pending_action == "awaiting_secret":
-        secret = os.getenv("ENV_BOT_SECRET", "").strip()
-        if not secret:
-            await reply_with_state(
-                message,
-                "服务端未配置 ENV_BOT_SECRET，无法完成验证。",
-                settings=settings,
-                pending_action="awaiting_secret",
-            )
-            return
-        if text != secret:
-            await reply_with_state(
-                message,
-                "密码不正确，请重试。",
-                settings=settings,
-                pending_action="awaiting_secret",
-            )
-            return
-        settings = store.authorize_user(
-            user.id,
-            username=user.username or "",
-            first_name=user.first_name or "",
-        )
-        context.user_data[PENDING_ACTION_KEY] = "set_auth_mode"
-        await reply_with_state(
+    source_type = detect_text_source(text)
+    if source_type is None:
+        token = uuid.uuid4().hex[:8]
+        context.user_data[PENDING_AMBIGUOUS_KEY] = {"token": token, "text": text}
+        await _reply_html(
             message,
-            "验证成功。\n\n"
-            f"先从左下角菜单点 {html_code('/setauth')} 选择认证方式；后续设置也都从菜单触发。\n\n"
-            + build_help_text(settings),
-            settings=settings,
-            pending_action="set_auth_mode",
+            "无法确定这段内容的来源，请选择处理方式。",
+            reply_markup=build_source_choice_keyboard(token),
         )
         return
-
-    if not settings.authorized:
-        context.user_data[PENDING_ACTION_KEY] = "awaiting_secret"
-        await reply_with_state(
-            message,
-            "请先点击“开始使用”并发送密码完成验证。",
-            settings=settings,
-            pending_action="awaiting_secret",
-        )
-        return
-
-    if pending_action == "set_api_key":
-        settings = store.upsert_user(user.id, auth_mode=AUTH_MODE_GEMINI_API_KEY, api_key=text)
-        context.user_data.pop(PENDING_ACTION_KEY, None)
-        await reply_with_state(message, "API Key 已保存。\n\n" + render_settings(settings), settings=settings)
-        return
-
-    if pending_action == "set_auth_mode":
-        auth_mode = parse_auth_mode(text)
-        if auth_mode is None:
-            await reply_with_state(
-                message,
-                f"认证方式无效，请回复 {html_code('gemini')} 或 {html_code('vertex')}，"
-                f"或直接发送 {html_code('/setauth gemini')} / {html_code('/setauth vertex')}。",
-                settings=settings,
-                pending_action="set_auth_mode",
-            )
-            return
-        await apply_auth_mode_selection(message, context, settings, auth_mode)
-        return
-
-    if pending_action == "set_vertex_json":
-        settings = store.upsert_user(
-            user.id,
-            auth_mode=AUTH_MODE_VERTEX_AI_JSON,
-            vertex_json=text,
-        )
-        context.user_data.pop(PENDING_ACTION_KEY, None)
-        await reply_with_state(message, "Vertex AI JSON 已保存。\n\n" + render_settings(settings), settings=settings)
-        return
-
-    if pending_action == "set_vertex_project":
-        settings = store.upsert_user(user.id, vertex_project=text)
-        context.user_data.pop(PENDING_ACTION_KEY, None)
-        await reply_with_state(message, "Vertex project 已保存。\n\n" + render_settings(settings), settings=settings)
-        return
-
-    if pending_action == "set_vertex_location":
-        settings = store.upsert_user(user.id, vertex_location=text)
-        context.user_data.pop(PENDING_ACTION_KEY, None)
-        await reply_with_state(message, "Vertex location 已保存。\n\n" + render_settings(settings), settings=settings)
-        return
-
-    if pending_action == "set_model_name":
-        settings = store.upsert_user(user.id, model_name=text)
-        context.user_data.pop(PENDING_ACTION_KEY, None)
-        await reply_with_state(message, "模型已保存。\n\n" + render_settings(settings), settings=settings)
-        return
-
-    if pending_action == "set_promoters":
-        settings = store.upsert_user(user.id, promoters=text)
-        context.user_data.pop(PENDING_ACTION_KEY, None)
-        await reply_with_state(message, "Prompt 已保存。\n\n" + render_settings(settings), settings=settings)
-        return
-
-    if pending_action == "set_source_type":
-        normalized = parse_source_type(text)
-        if normalized not in SUPPORTED_SOURCE_TYPES:
-            await reply_with_state(
-                message,
-                f"来源类型无效，请回复 {html_code('audio')} / {html_code('youtube')} / {html_code('video_url')} / {html_code('douyin')}，"
-                f"或直接发送 {html_code('/setsource audio')} 等命令。",
-                settings=settings,
-                pending_action="set_source_type",
-            )
-            return
-        await apply_source_type_selection(message, context, settings, normalized)
-        return
-
-    if settings.source_type == "audio":
-        await reply_with_state(
-            message,
-            "当前来源类型是 audio，请发送音频文件、语音或音频 document。",
-            settings=settings,
-        )
-        return
-
-    if settings.source_type in {"youtube", "video_url"} and not _extract_first_url(text):
-        await reply_with_state(
-            message,
-            "当前来源类型需要链接，请发送完整 URL。",
-            settings=settings,
-        )
-        return
-
-    await process_transcription(update, context, settings, text_input=text)
+    await _enqueue_text(message, context, user.id, source_type, text)
 
 
 async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    settings = await ensure_authorized(update, context)
-    if message is None or settings is None:
+    user = update.effective_user
+    if message is None or user is None or not await ensure_authorized(update, context):
         return
-
-    if settings.source_type != "audio":
-        await reply_with_state(
-            message,
-            f"当前保存的来源类型是 {html_code(settings.source_type)}，请先点击“设置来源类型”并切换到 {html_code('audio')} 再发送音频。",
-            settings=settings,
-        )
-        return
-
     source_file = message.audio or message.voice or message.document
     if source_file is None:
-        await reply_with_state(message, "未检测到可处理的音频文件。", settings=settings)
+        await message.reply_text("未检测到音频文件。")
+        return
+    policy: MediaPolicy = context.application.bot_data["media_policy"]
+    file_size = int(getattr(source_file, "file_size", 0) or 0)
+    if file_size and file_size > policy.max_media_bytes:
+        await message.reply_text("音频文件超过服务端大小限制。")
         return
 
-    suffix = ".mp3"
-    if getattr(source_file, "file_name", None):
-        suffix = Path(source_file.file_name).suffix or suffix
-    elif getattr(source_file, "mime_type", "") == "audio/ogg":
-        suffix = ".ogg"
-
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        prefix=f"tg_{settings.user_id}_",
-        suffix=suffix,
-        dir=str(UPLOAD_DIR),
-        delete=False,
-    ) as temp_file:
-        temp_path = Path(temp_file.name)
-
+    paths: BotPaths = context.application.bot_data["paths"]
+    original = getattr(source_file, "file_name", "") or "voice.ogg"
+    safe_name = sanitize_upload_name(original, default="voice.ogg")
+    destination = paths.uploads_dir / f"tg_{user.id}_{uuid.uuid4().hex}_{safe_name}"
     telegram_file = await source_file.get_file()
-    await telegram_file.download_to_drive(custom_path=str(temp_path))
-    await process_transcription(
-        update,
+    await telegram_file.download_to_drive(custom_path=str(destination))
+    if destination.stat().st_size > policy.max_media_bytes:
+        destination.unlink(missing_ok=True)
+        await message.reply_text("音频文件超过服务端大小限制。")
+        return
+    await _enqueue_job(
+        message,
         context,
-        settings,
-        audio_path=temp_path,
-        original_filename=getattr(source_file, "file_name", temp_path.name),
+        user_id=user.id,
+        source_type="audio",
+        audio_path=str(destination),
+        original_filename=original,
     )
 
 
-def resolve_auth_config(settings: UserSettings):
-    auth_mode = settings.auth_mode or os.getenv("AUTH_MODE") or DEFAULT_AUTH_MODE
-    return build_auth_config(
-        auth_mode=auth_mode,
-        api_key=settings.api_key,
-        vertex_json=settings.vertex_json,
-        vertex_project=settings.vertex_project,
-        vertex_location=settings.vertex_location or DEFAULT_VERTEX_LOCATION,
-    )
+async def legacy_settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await settings_command(update, context)
 
 
-def save_transcript_file(user_id: int, source_type: str, transcript: str, name_hint: Optional[str]) -> Path:
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    stem = sanitize_name(name_hint or f"{source_type}_{int(time.time())}")
-    output_path = OUTPUT_DIR / f"{user_id}_{stem}.txt"
-    output_path.write_text(transcript, encoding="utf-8")
-    return output_path
-
-
-def execute_transcription(
-    settings: UserSettings,
-    source_type: str,
-    *,
-    text_input: Optional[str],
-    audio_path: Optional[Path],
-    original_filename: Optional[str],
-    on_chunk,
-    on_status,
-) -> TranscriptionResult:
-    auth_config = resolve_auth_config(settings)
-    if auth_config.auth_mode == AUTH_MODE_GEMINI_API_KEY and not auth_config.api_key:
-        raise RuntimeError("未设置 Gemini API Key，请先使用 /setkey 设置，或在 .env 里提供 GOOGLE_API_KEY。")
-    if auth_config.auth_mode == AUTH_MODE_VERTEX_AI_JSON and not auth_config.vertex_json:
-        raise RuntimeError(
-            "未设置 Vertex AI JSON，请先使用 /setvertexjson 设置，或在 .env 里提供 GOOGLE_APPLICATION_CREDENTIALS。"
-        )
-
-    if source_type == "audio":
-        if audio_path is None:
-            raise RuntimeError("缺少音频文件。")
-        on_status("开始转写音频")
-        transcript = transcribe_audio_streaming(
-            api_key=auth_config.api_key,
-            audio_path=str(audio_path),
-            model_name=settings.model_name,
-            promoters=settings.promoters or None,
-            on_chunk=on_chunk,
-            auth_mode=auth_config.auth_mode,
-            vertex_json=auth_config.vertex_json,
-            vertex_project=auth_config.vertex_project,
-            vertex_location=auth_config.vertex_location,
-        )
-        name_hint = Path(original_filename or audio_path.name).stem
-        return TranscriptionResult(
-            transcript=transcript,
-            output_path=save_transcript_file(settings.user_id, source_type, transcript, name_hint),
-        )
-
-    if not text_input:
-        raise RuntimeError("缺少文本输入。")
-
-    if source_type == "youtube":
-        on_status("开始转写（YouTube 直连）")
-        transcript = transcribe_youtube_url_streaming(
-            api_key=auth_config.api_key,
-            youtube_url=text_input,
-            model_name=settings.model_name,
-            promoters=settings.promoters or None,
-            on_chunk=on_chunk,
-            auth_mode=auth_config.auth_mode,
-            vertex_json=auth_config.vertex_json,
-            vertex_project=auth_config.vertex_project,
-            vertex_location=auth_config.vertex_location,
-        )
-        name_hint = _extract_first_url(text_input) or f"youtube_{int(time.time())}"
-        return TranscriptionResult(
-            transcript=transcript,
-            output_path=save_transcript_file(settings.user_id, source_type, transcript, name_hint),
-        )
-
-    if source_type == "video_url":
-        on_status("下载视频并提取音频")
-        local_audio_path = Path(download_video_and_extract_audio(text_input, str(UPLOAD_DIR)))
-        on_status("开始转写视频音频")
-        transcript = transcribe_audio_streaming(
-            api_key=auth_config.api_key,
-            audio_path=str(local_audio_path),
-            model_name=settings.model_name,
-            promoters=settings.promoters or None,
-            on_chunk=on_chunk,
-            auth_mode=auth_config.auth_mode,
-            vertex_json=auth_config.vertex_json,
-            vertex_project=auth_config.vertex_project,
-            vertex_location=auth_config.vertex_location,
-        )
-        return TranscriptionResult(
-            transcript=transcript,
-            output_path=save_transcript_file(settings.user_id, source_type, transcript, local_audio_path.stem),
-        )
-
-    if source_type == "douyin":
-        on_status("解析抖音分享内容")
-        mp3_url, _, tiktok_id = fetch_douyin_mp3_via_tiksave(text_input)
-        stem = f"douyin_{tiktok_id}" if tiktok_id else f"douyin_{int(time.time())}"
-        on_status("下载抖音音频")
-        local_audio_path = Path(
-            download_audio_from_direct_url(
-                mp3_url,
-                output_dir=str(UPLOAD_DIR),
-                preferred_ext="mp3",
-                filename_stem=stem,
-            )
-        )
-        on_status("开始转写抖音音频")
-        transcript = transcribe_audio_streaming(
-            api_key=auth_config.api_key,
-            audio_path=str(local_audio_path),
-            model_name=settings.model_name,
-            promoters=settings.promoters or None,
-            on_chunk=on_chunk,
-            auth_mode=auth_config.auth_mode,
-            vertex_json=auth_config.vertex_json,
-            vertex_project=auth_config.vertex_project,
-            vertex_location=auth_config.vertex_location,
-        )
-        return TranscriptionResult(
-            transcript=transcript,
-            output_path=save_transcript_file(settings.user_id, source_type, transcript, stem),
-        )
-
-    raise RuntimeError(f"不支持的来源类型：{source_type}")
-
-
-async def stream_events(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    queue: "asyncio.Queue[Optional[dict]]",
-    status_message: Message,
-) -> None:
-    current_message: Optional[Message] = None
-    current_text = ""
-    staged = ""
-    last_edit_at = 0.0
-
-    while True:
-        timed_out = False
-        try:
-            event = await asyncio.wait_for(queue.get(), timeout=STREAM_EDIT_INTERVAL_SECONDS)
-        except asyncio.TimeoutError:
-            event = {}
-            timed_out = True
-
-        reached_end = (not timed_out) and (event is None)
-        if isinstance(event, dict):
-            event_type = event.get("type")
-            if event_type == "status":
-                await safe_edit_text(status_message, f"状态：{event['data']}")
-            elif event_type == "chunk":
-                staged += event["data"]
-
-        should_flush = staged and (
-            reached_end
-            or len(staged) >= STREAM_MIN_BUFFER
-            or (time.monotonic() - last_edit_at) >= STREAM_EDIT_INTERVAL_SECONDS
-        )
-
-        if should_flush:
-            while staged:
-                if current_message is None:
-                    chunk = staged[:MAX_MESSAGE_LENGTH]
-                    staged = staged[MAX_MESSAGE_LENGTH:]
-                    current_message = await context.bot.send_message(chat_id=chat_id, text=chunk)
-                    current_text = chunk
-                    last_edit_at = time.monotonic()
-                    continue
-
-                available = MAX_MESSAGE_LENGTH - len(current_text)
-                if available <= 0:
-                    chunk = staged[:MAX_MESSAGE_LENGTH]
-                    staged = staged[MAX_MESSAGE_LENGTH:]
-                    current_message = await context.bot.send_message(chat_id=chat_id, text=chunk)
-                    current_text = chunk
-                    last_edit_at = time.monotonic()
-                    continue
-
-                piece = staged[:available]
-                staged = staged[available:]
-                current_text += piece
-                await safe_edit_text(current_message, current_text)
-                last_edit_at = time.monotonic()
-
-        if reached_end:
-            break
-
-
-async def process_transcription(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    settings: UserSettings,
-    *,
-    text_input: Optional[str] = None,
-    audio_path: Optional[Path] = None,
-    original_filename: Optional[str] = None,
-) -> None:
+async def legacy_source_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    chat = update.effective_chat
-    if message is None or chat is None:
+    if message is None or not await ensure_authorized(update, context):
         return
+    await _reply_html(message, "来源类型现在会自动识别，直接发送内容即可。", reply_markup=build_home_keyboard())
 
-    active_jobs = context.application.bot_data.setdefault("active_jobs", set())
-    if settings.user_id in active_jobs:
-        await message.reply_text("当前已有任务在执行，请等待上一任务完成。")
+
+async def reject_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text("此机器人仅支持私聊。")
+
+
+async def _safe_edit_status(
+    application: Application,
+    job: TelegramJob,
+    text: str,
+    markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    if not job.status_message_id:
         return
-
-    active_jobs.add(settings.user_id)
-    await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-    status_message = await message.reply_text("状态：任务已接收，准备开始")
-    queue: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-
-    def on_chunk(delta: str) -> None:
-        loop.call_soon_threadsafe(queue.put_nowait, {"type": "chunk", "data": delta})
-
-    def on_status(text: str) -> None:
-        loop.call_soon_threadsafe(queue.put_nowait, {"type": "status", "data": text})
-
-    stream_task = asyncio.create_task(stream_events(context, chat.id, queue, status_message))
-
     try:
-        result = await asyncio.to_thread(
-            execute_transcription,
-            settings,
-            settings.source_type,
-            text_input=text_input,
-            audio_path=audio_path,
-            original_filename=original_filename,
-            on_chunk=on_chunk,
-            on_status=on_status,
+        await application.bot.edit_message_text(
+            chat_id=job.chat_id,
+            message_id=job.status_message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
         )
-        await queue.put({"type": "status", "data": "转写完成，正在整理结果"})
-        await queue.put(None)
-        await stream_task
-        await safe_edit_text(status_message, "状态：转写完成")
-        with result.output_path.open("rb") as transcript_file:
-            await message.reply_document(
-                document=transcript_file,
-                filename=result.output_path.name,
-                caption="转写完成，已附上 txt 文件。",
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            logger.warning(
+                "Unable to edit Telegram job status: %s",
+                sanitize_error_detail(exc),
             )
     except Exception as exc:
-        await queue.put(None)
-        await stream_task
-        await safe_edit_text(status_message, f"状态：任务失败 - {exc}")
-        await message.reply_text(f"转写失败：{exc}")
-    finally:
-        active_jobs.discard(settings.user_id)
+        logger.warning(
+            "Unable to edit Telegram job status: %s",
+            sanitize_error_detail(exc),
+        )
 
 
-def build_application() -> Application:
-    token = os.getenv("ENV_BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("缺少 ENV_BOT_TOKEN，请先在 .env 中配置 Telegram Bot Token。")
+_STATUS_LABELS = {
+    "preparing": "正在准备任务",
+    "parsing": "正在解析来源",
+    "downloading": "正在下载媒体",
+    "extracting": "正在抽取音频",
+    "retrying": "临时失败，正在重试",
+    "transcribing": "正在转写",
+    "delivering": "正在发送结果",
+}
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    application = Application.builder().token(token).post_init(configure_bot_commands).build()
-    application.bot_data["store"] = make_store()
-    application.bot_data["active_jobs"] = set()
+async def _execute_job(
+    application: Application,
+    job: TelegramJob,
+    cancelled: Callable[[], bool],
+) -> TranscriptionResult:
+    service: TranscriptionService = application.bot_data["transcription_service"]
+    manager: TelegramJobManager = application.bot_data["job_manager"]
+    timeout = application.bot_data["media_policy"].task_timeout_seconds
+    loop = asyncio.get_running_loop()
+    current_stage = {"value": "preparing"}
+    stage_lock = threading.Lock()
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CommandHandler("setauth", setauth_command))
-    application.add_handler(CommandHandler("setkey", setkey_command))
-    application.add_handler(CommandHandler("setvertexjson", setvertexjson_command))
-    application.add_handler(CommandHandler("setvertexproject", setvertexproject_command))
-    application.add_handler(CommandHandler("setvertexlocation", setvertexlocation_command))
-    application.add_handler(CommandHandler("setmodel", setmodel_command))
-    application.add_handler(CommandHandler("setsource", setsource_command))
-    application.add_handler(CommandHandler("setpromoters", setpromoters_command))
-    application.add_handler(CommandHandler("setprompt", setpromoters_command))
-    application.add_handler(CommandHandler("resetpromoters", resetpromoters_command))
-    application.add_handler(CommandHandler("resetprompt", resetpromoters_command))
-    application.add_handler(
-        MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.AUDIO, handle_audio_message)
+    def on_status(status: str) -> None:
+        with stage_lock:
+            current_stage["value"] = status
+        manager.update_stage(job.job_id, status)
+        label = _STATUS_LABELS.get(status, status)
+        operation = _safe_edit_status(
+            application,
+            job,
+            f"<b>{escape(label)}</b>\n任务：{html_code(job.job_id[:8])}",
+            build_cancel_job_keyboard(job.job_id),
+        )
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            loop.create_task(operation)
+        else:
+            asyncio.run_coroutine_threadsafe(operation, loop)
+
+    request = TranscriptionRequest(
+        source_type=job.source_type,
+        text_input=job.text_input or None,
+        audio_path=Path(job.audio_path) if job.audio_path else None,
+        original_filename=job.original_filename or None,
+        cleanup_input=bool(job.audio_path),
     )
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    return application
+    try:
+        async_execute = getattr(service, "execute_async", None)
+        if callable(async_execute):
+            result = await async_execute(
+                request,
+                on_status=on_status,
+                cancelled=cancelled,
+                deadline=TaskDeadline(timeout),
+            )
+        else:
+            result = await asyncio.to_thread(
+                service.execute,
+                request,
+                on_status=on_status,
+                cancelled=cancelled,
+                deadline=TaskDeadline(timeout),
+            )
+        if cancelled():
+            raise TaskCancelled("任务已取消。")
+        on_status("delivering")
+        await _deliver_result(application, job, result)
+        return result
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        with stage_lock:
+            stage = current_stage["value"]
+        diagnosis = (
+            exc.diagnosis
+            if isinstance(exc, JobExecutionFailure)
+            else diagnose_exception(exc)
+        )
+        raise JobExecutionFailure(stage, diagnosis) from exc
+
+
+def _remove_paths(paths) -> None:
+    for raw_path in paths:
+        try:
+            Path(raw_path).unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "Unable to delete job file: %s", Path(raw_path).name
+            )
+
+
+async def _deliver_result(
+    application: Application,
+    job: TelegramJob,
+    result: TranscriptionResult,
+) -> None:
+    cache: ResultCache = application.bot_data["result_cache"]
+    cache.put(job.job_id, result.transcript)
+    transcript = result.transcript or ""
+    is_long = len(transcript) > SHORT_TRANSCRIPT_LIMIT
+    paths: BotPaths = application.bot_data["paths"]
+    output_path = paths.outputs_dir / f"{job.job_id}_{sanitize_upload_name(result.filename_stem, default='transcript')}.txt"
+    delivered = False
+    try:
+        if is_long:
+            preview = transcript[:TRANSCRIPT_PREVIEW_LIMIT].rstrip()
+            await application.bot.send_message(
+                chat_id=job.chat_id,
+                text=f"{preview}\n\n……（完整内容见 txt 文件）",
+            )
+        elif transcript:
+            await application.bot.send_message(chat_id=job.chat_id, text=transcript)
+        output_path.write_text(transcript, encoding="utf-8")
+        with output_path.open("rb") as handle:
+            await application.bot.send_document(
+                chat_id=job.chat_id,
+                document=handle,
+                filename=f"{result.filename_stem}.txt",
+                caption="转写完成。",
+            )
+        delivered = True
+    finally:
+        output_path.unlink(missing_ok=True)
+        if delivered:
+            _remove_paths(result.cleanup_paths)
+
+    await _safe_edit_status(
+        application,
+        job,
+        "<b>转写完成</b>\n结果已发送。",
+        build_result_keyboard(job.job_id, include_full=is_long),
+    )
+
+
+def _safe_trace_locations(exc: BaseException) -> str:
+    selected = None
+    current: Optional[BaseException] = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if current.__traceback__ is not None:
+            selected = current
+        current = current.__cause__ or current.__context__
+    if selected is not None:
+        frames = traceback.extract_tb(selected.__traceback__)[-8:]
+        if frames:
+            return " > ".join(
+                f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+                for frame in frames
+            )
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return "telegram_jobs.py:_worker(timeout_boundary)"
+    return "unavailable"
+
+
+async def _on_job_update(
+    application: Application,
+    job: TelegramJob,
+    event: str,
+    payload,
+) -> None:
+    if event == "running":
+        await _safe_edit_status(
+            application,
+            job,
+            f"<b>开始处理</b>\n任务：{html_code(job.job_id[:8])}",
+            build_cancel_job_keyboard(job.job_id),
+        )
+    elif event == "succeeded":
+        return
+    elif event == "cancelled":
+        cleanup_paths = [job.audio_path] if job.audio_path else []
+        if isinstance(payload, TranscriptionResult):
+            cleanup_paths.extend(payload.cleanup_paths)
+        _remove_paths(cleanup_paths)
+        await _safe_edit_status(application, job, "<b>任务已取消</b>", build_home_keyboard())
+    elif event == "failed":
+        failure = payload if isinstance(payload, BaseException) else RuntimeError()
+        diagnosis = (
+            failure.diagnosis
+            if isinstance(failure, JobExecutionFailure)
+            else diagnose_exception(failure)
+        )
+        trace_locations = _safe_trace_locations(failure)
+        logger.error(
+            "telegram_job_failed job_id=%s source=%s stage=%s category=%s "
+            "error_type=%s detail=%s trace=%s",
+            job.job_id,
+            job.source_type,
+            job.stage or "preparing",
+            diagnosis.code,
+            diagnosis.error_type,
+            diagnosis.log_detail or "-",
+            trace_locations,
+        )
+        reason = job.error_message or diagnosis.user_message
+        await _safe_edit_status(
+            application,
+            job,
+            render_job_failure(job.stage, reason),
+            build_failed_job_keyboard(job.job_id),
+        )
 
 
 async def configure_bot_commands(application: Application) -> None:
@@ -1311,38 +1521,215 @@ async def configure_bot_commands(application: Application) -> None:
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
+async def handle_telegram_error(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    error = context.error if isinstance(context.error, BaseException) else RuntimeError()
+    diagnosis = diagnose_exception(error)
+    logger.error(
+        "telegram_update_failed update_type=%s category=%s error_type=%s "
+        "detail=%s trace=%s",
+        type(update).__name__ if update is not None else "None",
+        diagnosis.code,
+        diagnosis.error_type,
+        diagnosis.log_detail or "-",
+        _safe_trace_locations(error),
+    )
+
+
+async def _maintenance_loop(application: Application) -> None:
+    while True:
+        try:
+            application.bot_data["result_cache"].evict()
+            manager: TelegramJobManager = application.bot_data["job_manager"]
+            active_paths = {
+                job.audio_path
+                for job in manager.snapshot()
+                if job.audio_path and job.status in {"queued", "running", "cancelling"}
+            }
+            cleanup_expired_media(
+                application.bot_data["paths"],
+                active_paths=active_paths,
+                max_age_seconds=24 * 3600,
+            )
+            cleanup_expired_outputs(
+                application.bot_data["paths"],
+                max_age_seconds=7 * 86400,
+            )
+            manager.prune_terminal(max_age_seconds=24 * 3600)
+        except Exception:
+            logger.exception("Telegram maintenance pass failed")
+        await asyncio.sleep(3600)
+
+
+async def initialize_services(application: Application) -> None:
+    if application.bot_data.get("services_started"):
+        return
+    await configure_bot_commands(application)
+    await application.bot_data["job_manager"].start()
+    application.bot_data["maintenance_task"] = asyncio.create_task(
+        _maintenance_loop(application), name="telegram-maintenance"
+    )
+    application.bot_data["services_started"] = True
+
+    for job in application.bot_data["job_manager"].interrupted_jobs():
+        try:
+            await application.bot.send_message(
+                chat_id=job.chat_id,
+                text=f"任务 {job.job_id[:8]} 因服务重启而中断。",
+                reply_markup=build_failed_job_keyboard(job.job_id),
+            )
+            application.bot_data["job_manager"].mark_restart_notified(job.job_id)
+        except Exception:
+            logger.warning("Unable to notify interrupted job %s", job.job_id)
+
+
+async def shutdown_services(application: Application) -> None:
+    task = application.bot_data.pop("maintenance_task", None)
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    manager = application.bot_data.get("job_manager")
+    if manager is not None:
+        await manager.stop()
+    application.bot_data["services_started"] = False
+
+
+def build_application() -> Application:
+    token = os.getenv("ENV_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("缺少 ENV_BOT_TOKEN，请先在 .env 中配置 Telegram Bot Token。")
+
+    paths = BotPaths.from_environ(ROOT_DIR)
+    paths.ensure_directories()
+    config_store = GlobalConfigStore(paths.global_config_file)
+    migrate_legacy_user_settings(paths.state_file, config_store)
+    run_legacy_media_cleanup(paths, config_store)
+    state_store = BotStateStore(str(paths.state_file))
+    secret = os.getenv("ENV_BOT_SECRET", "").strip()
+    state_store.bind_legacy_authorizations(secret)
+    try:
+        allowed_user_ids = parse_user_ids(os.getenv("TG_ALLOWED_USER_IDS", ""))
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    settings = config_store.get()
+    key_pool = GeminiKeyPool(settings.gemini_api_keys)
+    media_policy = MediaPolicy.from_environ()
+    transcription_service = TranscriptionService(
+        config_store,
+        key_pool,
+        work_dir=paths.uploads_dir,
+        media_policy=media_policy,
+    )
+
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(initialize_services)
+        .post_shutdown(shutdown_services)
+        .build()
+    )
+
+    async def executor(job: TelegramJob, cancelled: Callable[[], bool]):
+        return await _execute_job(application, job, cancelled)
+
+    async def on_update(job: TelegramJob, event: str, payload):
+        await _on_job_update(application, job, event, payload)
+
+    job_manager = TelegramJobManager(
+        JobStore(paths.jobs_file),
+        executor,
+        max_concurrent_jobs=int(os.getenv("TG_MAX_CONCURRENT_JOBS", "1")),
+        task_timeout_seconds=media_policy.task_timeout_seconds,
+        on_update=on_update,
+    )
+    application.bot_data.update(
+        {
+            "paths": paths,
+            "store": state_store,
+            "config_store": config_store,
+            "key_pool": key_pool,
+            "media_policy": media_policy,
+            "transcription_service": transcription_service,
+            "job_manager": job_manager,
+            "result_cache": ResultCache(),
+            "allowed_user_ids": allowed_user_ids,
+            "bot_secret": secret,
+            "key_validator": _validate_api_key,
+            "model_loader": _list_models_for_key,
+            "channel_health_checker": check_current_channel,
+            "services_started": False,
+        }
+    )
+
+    application.add_error_handler(handle_telegram_error)
+
+    private = filters.ChatType.PRIVATE
+    application.add_handler(CommandHandler("start", start_command, filters=private))
+    application.add_handler(CommandHandler("settings", settings_command, filters=private))
+    application.add_handler(CommandHandler("help", help_command, filters=private))
+    application.add_handler(CommandHandler("cancel", cancel_command, filters=private))
+    for command in (
+        "setauth",
+        "setkey",
+        "setvertexjson",
+        "setvertexproject",
+        "setvertexlocation",
+        "setmodel",
+        "setprompt",
+        "resetprompt",
+    ):
+        application.add_handler(CommandHandler(command, legacy_settings_command, filters=private))
+    application.add_handler(CommandHandler("setsource", legacy_source_command, filters=private))
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
+    application.add_handler(
+        MessageHandler(
+            private & (filters.AUDIO | filters.VOICE | filters.Document.AUDIO),
+            handle_audio_message,
+        )
+    )
+    application.add_handler(
+        MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_text_message)
+    )
+    application.add_handler(
+        MessageHandler(filters.ChatType.GROUPS, reject_group_message)
+    )
+    return application
+
+
 async def start_embedded_polling(application: Application) -> None:
     updater = application.updater
     if updater is None:
         raise RuntimeError("Telegram updater 不可用，无法启动 polling。")
-
     try:
         await application.initialize()
-        await configure_bot_commands(application)
+        await initialize_services(application)
         await application.start()
         await updater.start_polling(allowed_updates=Update.ALL_TYPES)
     except Exception:
+        await shutdown_services(application)
         try:
             await application.stop()
         finally:
             await application.shutdown()
         raise
-
     logger.info("Telegram bot polling started in embedded mode.")
 
 
 async def stop_embedded_polling(application: Application) -> None:
     updater = application.updater
-
     try:
         if updater is not None and updater.running:
             await updater.stop()
+        await shutdown_services(application)
     finally:
         try:
-            await application.stop()
+            if application.running:
+                await application.stop()
         finally:
             await application.shutdown()
-
     logger.info("Telegram bot polling stopped.")
 
 
@@ -1351,6 +1738,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
         level=logging.INFO,
     )
+    # HTTPX logs Telegram API URLs at INFO level, and those URLs contain the
+    # bot token. Keep transport internals out of persistent service logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     application = build_application()
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

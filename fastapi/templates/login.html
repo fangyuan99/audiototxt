@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AudioToTxt 登录</title>
+    <link rel="stylesheet" href="/static/css/style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <article>
+        <h1>AudioToTxt</h1>
+        <p>请输入 Web 访问密钥。</p>
+        {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+        <form method="post" action="/login">
+          <label>
+            访问密钥
+            <input type="password" name="access_key" autocomplete="current-password" required />
+          </label>
+          <button type="submit">登录</button>
+        </form>
+      </article>
+    </main>
+  </body>
+</html>

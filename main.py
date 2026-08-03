@@ -7,6 +7,7 @@ import re
 import threading
 import glob
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -19,33 +20,30 @@ except Exception:  # pragma: no cover - optional dependency fallback
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(ROOT_DIR, ".env"))
 
-SYSTEM_PROMPT = """
-你是一名专业的听打员，只做逐字转写以及进行合理的合并与分段，不做任何总结、解释或翻译.
-严禁所有文字放到一个段落里，要分段。
-主要语言：zh。语言输出。若内容不确定或听不清，请在原位以方括号标注（如：[听不清 00:01:23]、[不确定：人名?]）。
-只输出纯文字稿，不要添加标题、前后缀或任何其它说明。
-"""
+SYSTEM_PROMPT = """你是一名专业的听打员，只负责忠实逐字转写。
+请进行合理分段并添加基础标点，但不要总结、解释、翻译或补充外部信息。
+保留原意、口头语和有意义的重复，只做最小必要的明显口误或错别字修正。
+明显多人对话可使用“说话人 1”“说话人 2”等匿名标签，不要猜测姓名。
+内容听不清时在原位标注，例如：[听不清 00:01:23] 或 [不确定：人名?]。
+只输出纯文字稿，不添加标题、前后缀或其它说明。"""
 
-CONTENT_PROMPT = """
-按音频内容逐字转写：\n"
-"- 进行合理的分段；\n"
-"- 每一段不要太长，会影响理解；\n"
-"- 仅做最小必要的错别字/口误更正，不改变原意；\n"
-"- 保留口头语和重复；\n"
-"- 仅添加基础标点；\n"
-"- 严禁翻译或补充外部信息；\n"
-"- 输出为纯文本。"
-"""
+CONTENT_PROMPT = """按媒体中的实际内容逐字转写，并保证段落长度便于阅读。"""
 
 
 def build_transcription_prompt(
-    language_hint: Optional[str] = "zh",
+    language_hint: Optional[str] = None,
     promoters: Optional[str] = None,
+    full_override: Optional[str] = None,
 ) -> str:
-    """Build the final transcription prompt with optional user-defined override."""
-    base_prompt = (promoters or "").strip()
-    if not base_prompt:
+    """Build the faithful base prompt plus optional appended/advanced rules."""
+    override = (full_override or "").strip()
+    if override:
+        base_prompt = override
+    else:
         base_prompt = f"{SYSTEM_PROMPT}\n\n{CONTENT_PROMPT}"
+        appended = (promoters or "").strip()
+        if appended:
+            base_prompt += f"\n\n附加要求：\n{appended}"
 
     language_line = f"主要语言：{language_hint}" if language_hint else "主要语言：按音频原语言"
     return f"{base_prompt}\n\n{language_line}"
@@ -153,13 +151,27 @@ def build_auth_config(
     )
 
 
-def build_genai_client(auth_config: GeminiAuthConfig):
+def build_genai_client(
+    auth_config: GeminiAuthConfig,
+    timeout_seconds: Optional[float] = None,
+):
     try:
         from google import genai
     except Exception as exc:  # pragma: no cover - runtime guidance only
         raise RuntimeError(
             "未检测到 google-genai 包。请先执行 `pip install -r requirements.txt`。"
         ) from exc
+
+    client_kwargs = {}
+    if timeout_seconds is not None:
+        try:
+            from google.genai import types
+
+            client_kwargs["http_options"] = types.HttpOptions(
+                timeout=max(1, int(timeout_seconds * 1000))
+            )
+        except Exception:
+            pass
 
     if auth_config.auth_mode == AUTH_MODE_VERTEX_AI_JSON:
         if not auth_config.vertex_json.strip():
@@ -195,6 +207,7 @@ def build_genai_client(auth_config: GeminiAuthConfig):
             project=project,
             location=location,
             credentials=credentials,
+            **client_kwargs,
         )
 
     if not auth_config.api_key.strip():
@@ -202,7 +215,7 @@ def build_genai_client(auth_config: GeminiAuthConfig):
             "缺少 Gemini API Key。请通过 --api-key / 页面表单填写，或设置环境变量 GOOGLE_API_KEY / GEMINI_API_KEY。"
         )
 
-    return genai.Client(api_key=auth_config.api_key.strip())
+    return genai.Client(api_key=auth_config.api_key.strip(), **client_kwargs)
 
 
 def ensure_package() -> None:
@@ -348,13 +361,15 @@ def transcribe_audio_streaming(
     api_key: Optional[str],
     audio_path: str,
     model_name: str = "gemini-2.5-flash",
-    language_hint: Optional[str] = 'zh',
+    language_hint: Optional[str] = None,
     promoters: Optional[str] = None,
     on_chunk=None,
     auth_mode: Optional[str] = None,
     vertex_json: Optional[str] = None,
     vertex_project: Optional[str] = None,
     vertex_location: Optional[str] = None,
+    full_prompt_override: Optional[str] = None,
+    request_timeout_seconds: Optional[float] = None,
 ) -> str:
     """Use Gemini to transcribe an audio file into text with streaming output.
 
@@ -370,8 +385,6 @@ def transcribe_audio_streaming(
         vertex_project=vertex_project,
         vertex_location=vertex_location,
     )
-    client = build_genai_client(auth_config)
-
     if not os.path.isfile(audio_path):
         raise FileNotFoundError(f"找不到音频文件：{audio_path}")
 
@@ -395,15 +408,17 @@ def transcribe_audio_streaming(
         mime_type = mime_type_map.get(file_ext, 'audio/mp3')  # 默认为 mp3
         
     except Exception as e:
-        raise RuntimeError(f"无法读取音频文件: {str(e)}") from e
+        raise RuntimeError("无法读取音频文件") from e
 
     full_prompt = build_transcription_prompt(
         language_hint=language_hint,
         promoters=promoters,
+        full_override=full_prompt_override,
     )
 
     content_data = types.Part.from_bytes(data=audio_data, mime_type=mime_type)
     config = _build_generate_content_config(types)
+    client = build_genai_client(auth_config, timeout_seconds=request_timeout_seconds)
 
     try:
         print("开始转写...", file=sys.stderr)
@@ -434,7 +449,7 @@ def transcribe_youtube_url_streaming(
     api_key: Optional[str],
     youtube_url: str,
     model_name: str = "gemini-2.5-flash",
-    language_hint: Optional[str] = 'zh',
+    language_hint: Optional[str] = None,
     promoters: Optional[str] = None,
     on_chunk=None,
     auth_mode: Optional[str] = None,
@@ -442,6 +457,8 @@ def transcribe_youtube_url_streaming(
     vertex_project: Optional[str] = None,
     vertex_location: Optional[str] = None,
     media_resolution: Optional[str] = "low",
+    full_prompt_override: Optional[str] = None,
+    request_timeout_seconds: Optional[float] = None,
 ) -> str:
     """Use Gemini to transcribe a public YouTube URL directly without downloading."""
     from google.genai import types
@@ -453,14 +470,14 @@ def transcribe_youtube_url_streaming(
         vertex_project=vertex_project,
         vertex_location=vertex_location,
     )
-    client = build_genai_client(auth_config)
-
     full_prompt = build_transcription_prompt(
         language_hint=language_hint,
         promoters=promoters,
+        full_override=full_prompt_override,
     )
     video_part = _part_from_uri(types, youtube_url, "video/mp4")
     config = _build_generate_content_config(types, media_resolution=media_resolution)
+    client = build_genai_client(auth_config, timeout_seconds=request_timeout_seconds)
 
     try:
         print("开始转写 YouTube（Gemini 直连）...", file=sys.stderr)
@@ -476,7 +493,7 @@ def transcribe_youtube_url_streaming(
             pass
         return transcript
     except Exception as e:
-        raise RuntimeError(f"YouTube 直连转写失败: {str(e)}") from e
+        raise RuntimeError("YouTube 直连转写失败") from e
     finally:
         try:
             client.close()
@@ -586,7 +603,7 @@ def download_audio_from_youtube(
                 file=sys.stderr,
             )
         else:
-            print(f"转码失败：{e}，尝试以原始格式下载。", file=sys.stderr)
+            print("转码失败，尝试以原始格式下载。", file=sys.stderr)
 
         try:
             opts = dict(base_opts)
@@ -599,12 +616,17 @@ def download_audio_from_youtube(
                 info = ydl.extract_info(youtube_url, download=True)
                 return _extract_path_with_ydl(ydl, info)
         except Exception as e2:
-            raise RuntimeError(f"下载失败：{e2}") from e
+            raise RuntimeError("YouTube 音频下载失败") from e2
 
 def download_video_and_extract_audio(
     video_url: str,
     output_dir: str = "./data",
     preferred_audio_codec: str = "m4a",
+    *,
+    media_policy=None,
+    cancelled=None,
+    deadline=None,
+    on_status=None,
 ) -> str:
     """从视频直链下载视频，使用ffmpeg提取音频并返回本地音频文件路径。
     如果文件本身就是音频格式，则跳过音频提取步骤。
@@ -620,28 +642,34 @@ def download_video_and_extract_audio(
     Raises:
         RuntimeError: 下载或音频提取失败时抛出
     """
-    import requests
     import subprocess
-    import tempfile
     from urllib.parse import urlparse
+
+    from media_policy import (
+        MediaPolicy,
+        download_public_url,
+        sanitize_upload_name,
+    )
     
     os.makedirs(output_dir, exist_ok=True)
     
     # 支持的音频格式列表
     AUDIO_EXTENSIONS = {'.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac', '.opus', '.wma'}
     
-    # 从URL中提取文件名，如果没有则使用时间戳
+    active_policy = media_policy or MediaPolicy.from_environ()
+
+    # 从 URL 中提取安全且唯一的文件名
     parsed_url = urlparse(video_url)
     url_path = parsed_url.path
     if url_path and '.' in url_path:
-        # 尝试从URL路径中提取文件名
-        original_filename = os.path.basename(url_path)
+        original_filename = sanitize_upload_name(os.path.basename(url_path), default="video.mp4")
         name, ext = os.path.splitext(original_filename)
         if not name:
             name = f"video_{int(time.time())}"
     else:
         name = f"video_{int(time.time())}"
         ext = ".mp4"  # 默认扩展名
+    name = f"{name[:70]}_{time.time_ns()}"
     
     # 检查是否是音频文件
     is_audio_file = ext.lower() in AUDIO_EXTENSIONS
@@ -655,38 +683,41 @@ def download_video_and_extract_audio(
     else:
         # 如果是视频文件，使用指定的音频编码
         audio_path = os.path.join(output_dir, f"{name}.{preferred_audio_codec}")
+    generated_audio_paths = {audio_path}
     
     try:
         if is_audio_file:
-            print(f"开始下载音频文件：{video_url}", file=sys.stderr)
+            print(
+                f"开始下载音频文件（host={parsed_url.hostname or 'unknown'}）",
+                file=sys.stderr,
+            )
         else:
-            print(f"开始下载视频文件：{video_url}", file=sys.stderr)
+            print(
+                f"开始下载视频文件（host={parsed_url.hostname or 'unknown'}）",
+                file=sys.stderr,
+            )
         
-        # 下载文件
-        # 获取系统代理设置
         proxies = _get_system_proxies()
-        response = requests.get(video_url, stream=True, proxies=proxies if proxies else None)
-        response.raise_for_status()
-        
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded_size = 0
-        last_pct = -5
-        
-        # 如果是音频文件，直接下载到最终路径；否则下载到临时路径
         download_path = audio_path if is_audio_file else temp_video_path
-        
-        with open(download_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded_size += len(chunk)
-                    
-                    # 显示下载进度
-                    if total_size > 0:
-                        pct = int(downloaded_size * 100 / total_size)
-                        if pct >= last_pct + 5:
-                            last_pct = pct
-                            print(f"下载进度：{pct}%", file=sys.stderr)
+        last_pct = {"value": -5}
+
+        def report_progress(downloaded: int, total: Optional[int]) -> None:
+            if not total:
+                return
+            pct = int(downloaded * 100 / max(total, 1))
+            if pct >= last_pct["value"] + 5:
+                last_pct["value"] = pct
+                print(f"下载进度：{pct}%", file=sys.stderr)
+
+        download_public_url(
+            video_url,
+            download_path,
+            policy=active_policy,
+            proxies=proxies if proxies else None,
+            cancelled=cancelled,
+            deadline=deadline,
+            on_progress=report_progress,
+        )
         
         # 如果是音频文件，跳过转换步骤
         if is_audio_file:
@@ -694,6 +725,8 @@ def download_video_and_extract_audio(
             return audio_path
         
         print("视频下载完成，开始提取音频...", file=sys.stderr)
+        if on_status is not None:
+            on_status("extracting")
         
         # 使用ffmpeg提取音频
         ffmpeg_codec = _get_ffmpeg_audio_codec(preferred_audio_codec)
@@ -705,21 +738,32 @@ def download_video_and_extract_audio(
             '-y',  # 覆盖输出文件
             audio_path
         ]
+
+        if cancelled is not None and cancelled():
+            raise RuntimeError("任务已取消。")
+        if deadline is not None:
+            deadline.check()
+        subprocess_timeout = max(1.0, deadline.remaining()) if deadline is not None else None
         
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ffmpeg_cmd,
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=subprocess_timeout,
             )
             print("音频提取完成", file=sys.stderr)
         except subprocess.CalledProcessError as e:
-            print(f"ffmpeg提取音频失败：{e.stderr}", file=sys.stderr)
+            print(
+                f"ffmpeg 提取音频失败（returncode={e.returncode}）",
+                file=sys.stderr,
+            )
             # 尝试使用mp3格式作为备选
             if preferred_audio_codec != "mp3":
                 print("尝试使用mp3格式重新提取...", file=sys.stderr)
                 audio_path = os.path.join(output_dir, f"{name}.mp3")
+                generated_audio_paths.add(audio_path)
                 ffmpeg_codec = _get_ffmpeg_audio_codec("mp3")
                 ffmpeg_cmd = [
                     'ffmpeg',
@@ -730,21 +774,31 @@ def download_video_and_extract_audio(
                     audio_path
                 ]
                 try:
-                    subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+                    subprocess.run(
+                        ffmpeg_cmd,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=subprocess_timeout,
+                    )
                     print("音频提取完成（mp3格式）", file=sys.stderr)
                 except subprocess.CalledProcessError as e2:
-                    raise RuntimeError(f"音频提取失败：{e2.stderr}")
+                    raise RuntimeError("ffmpeg 音频提取失败：输入不是有效媒体") from e2
             else:
-                raise RuntimeError(f"音频提取失败：{e.stderr}")
-        except FileNotFoundError:
-            raise RuntimeError("未找到ffmpeg，请确保已安装ffmpeg并添加到系统PATH中")
+                raise RuntimeError("ffmpeg 音频提取失败：输入不是有效媒体") from e
+        except FileNotFoundError as exc:
+            raise RuntimeError("未找到 ffmpeg，无法提取音频") from exc
         
         return audio_path
         
-    except requests.RequestException as e:
-        raise RuntimeError(f"下载文件失败：{e}")
     except Exception as e:
-        raise RuntimeError(f"处理文件失败：{e}")
+        for generated_path in generated_audio_paths:
+            try:
+                if os.path.exists(generated_path):
+                    os.remove(generated_path)
+            except OSError:
+                pass
+        raise RuntimeError("处理媒体文件失败") from e
     finally:
         # 只有视频文件才需要清理临时文件，音频文件不需要
         if not is_audio_file:
@@ -890,10 +944,10 @@ def resolve_douyin_aweme_id(short_or_share_text: str) -> str:
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        raise RuntimeError(f"请求 aweme_id 失败：{e}")
+        raise RuntimeError("请求 aweme_id 失败") from e
 
     if not isinstance(data, dict) or data.get("code") != 200:
-        raise RuntimeError(f"接口返回异常：{data}")
+        raise RuntimeError("aweme_id 接口返回异常")
     aweme_id = data.get("data")
     if not aweme_id:
         raise RuntimeError("未获取到 aweme_id")
@@ -911,7 +965,7 @@ def fetch_douyin_audio_url(aweme_id: str) -> str:
         resp.raise_for_status()
         j = resp.json()
     except Exception as e:
-        raise RuntimeError(f"请求音频信息失败：{e}")
+        raise RuntimeError("请求音频信息失败") from e
 
     try:
         detail = (
@@ -936,15 +990,19 @@ def fetch_douyin_audio_url(aweme_id: str) -> str:
     raise RuntimeError("未能从返回数据中解析到音频直链")
 
 
-def fetch_douyin_mp3_via_tiksave(share_text: str):
+def fetch_douyin_mp3_via_tiksave(
+    share_text: str,
+    *,
+    timeout_seconds: float = 30.0,
+    cancelled=None,
+    deadline=None,
+):
     """调用 downcats 接口，提取抖音音频直链及元信息。
 
     Returns:
         (mp3_url, title, tiktok_id)
     """
     import requests
-    import json
-
     url = "https://www.downcats.com/v1/extract/free/video"
     proxies = _get_system_proxies()
 
@@ -970,21 +1028,26 @@ def fetch_douyin_mp3_via_tiksave(share_text: str):
     }
 
     try:
+        if cancelled is not None and cancelled():
+            raise RuntimeError("任务已取消。")
+        if deadline is not None:
+            deadline.check()
+            timeout_seconds = min(timeout_seconds, max(1.0, deadline.remaining()))
         print("请求 downcats 接口...", file=sys.stderr)
         resp = requests.post(
             url,
             headers=headers,
             json=payload,
-            timeout=30,
+            timeout=max(1.0, timeout_seconds),
             proxies=proxies if proxies else None
         )
         resp.raise_for_status()
         j = resp.json()
     except Exception as e:
-        raise RuntimeError(f"downcats 接口请求失败：{e}")
+        raise RuntimeError("抖音解析服务请求失败") from e
 
     if not isinstance(j, dict) or j.get("code") != "OK":
-        raise RuntimeError(f"downcats 返回异常：{j}")
+        raise RuntimeError("抖音解析服务返回异常")
 
     data = j.get("data") or {}
     if not data:
@@ -1009,10 +1072,15 @@ def download_audio_from_direct_url(
     output_dir: str = "./data",
     preferred_ext: str = "m4a",
     filename_stem: Optional[str] = None,
+    *,
+    media_policy=None,
+    cancelled=None,
+    deadline=None,
 ) -> str:
     """下载音频直链到本地并返回文件路径。默认保存为 m4a。"""
-    import requests
     from urllib.parse import urlparse
+
+    from media_policy import MediaPolicy, download_public_url, sanitize_upload_name
 
     os.makedirs(output_dir, exist_ok=True)
     proxies = _get_system_proxies()
@@ -1026,30 +1094,39 @@ def download_audio_from_direct_url(
     if not ext:
         ext = "." + preferred_ext.lstrip(".")
 
+    if not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", ext or ""):
+        ext = "." + preferred_ext.lstrip(".")
     if not filename_stem:
         filename_stem = f"douyin_{int(time.time())}"
-    out_path = os.path.join(output_dir, filename_stem + ext)
+    safe_stem = Path(sanitize_upload_name(filename_stem, default="audio")).stem
+    out_path = os.path.join(output_dir, f"{safe_stem}_{time.time_ns()}{ext.lower()}")
 
     try:
-        print(f"开始下载音频：{audio_url}", file=sys.stderr)
-        with requests.get(audio_url, stream=True, timeout=60, proxies=proxies if proxies else None) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            downloaded = 0
-            last_pct = -5
-            with open(out_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    if total > 0:
-                        downloaded += len(chunk)
-                        pct = int(downloaded * 100 / max(total, 1))
-                        if pct >= last_pct + 5:
-                            last_pct = pct
-                            print(f"下载进度：{pct}%", file=sys.stderr)
+        print(
+            f"开始下载音频（host={parsed.hostname or 'unknown'}）",
+            file=sys.stderr,
+        )
+        last_pct = {"value": -5}
+
+        def report_progress(downloaded: int, total: Optional[int]) -> None:
+            if not total:
+                return
+            pct = int(downloaded * 100 / max(total, 1))
+            if pct >= last_pct["value"] + 5:
+                last_pct["value"] = pct
+                print(f"下载进度：{pct}%", file=sys.stderr)
+
+        download_public_url(
+            audio_url,
+            out_path,
+            policy=media_policy or MediaPolicy.from_environ(),
+            proxies=proxies if proxies else None,
+            cancelled=cancelled,
+            deadline=deadline,
+            on_progress=report_progress,
+        )
     except Exception as e:
-        raise RuntimeError(f"下载音频失败：{e}")
+        raise RuntimeError("下载音频失败") from e
 
     return out_path
 

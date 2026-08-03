@@ -1,72 +1,63 @@
-## AudioToTxt（FastAPI 可视化分支）
+# AudioToTxt Web UI
 
-此分支为项目提供基于 FastAPI 的可视化网页，支持上传音频或通过各类链接获取音频，并在网页上实时显示处理进度与转写内容。
+Web UI 默认关闭，并与 Telegram 共用全局 Gemini/Vertex、模型、语言与 Prompt 配置。页面不再接收或持久化 API Key、Vertex JSON 或代理配置。
 
-### 功能
-- 可视化页面操作（表单选择来源，一键开始）
-- 实时进度同步（WebSocket 推送：处理状态/转写中）
-- 流式转写展示（边生成边追加到页面）
-- 一键复制全文（转写区域“复制全文”按钮）
-- 结果下载（转写完成后提供 `.txt` 下载链接）
-- 表单配置持久化（localStorage 自动保存与恢复）
-- 支持来源：本地文件、YouTube 链接、视频直链、抖音分享口令/短链（Tiksave）
-- YouTube 链接通过 Gemini 直连转写，不会先下载到本地（仅支持公开视频）
+## 启用
 
-### 运行
-1) 安装依赖（项目根目录）：
-```bash
-python -m pip install -r requirements.txt
+在项目根目录 `.env` 中显式配置：
+
+```dotenv
+WEB_ENABLED=true
+WEB_ACCESS_KEY=replace-with-a-strong-independent-key
+WEB_DATA_DIR=./data/web
 ```
 
-2) 启动服务（项目根目录）：
+如果 `WEB_ENABLED` 未开启，服务只暴露健康检查；如果开启但 `WEB_ACCESS_KEY` 为空，服务会失败关闭，所有操作端点均不可用。
+
+启动：
+
 ```bash
 python fastapi/run.py
 python fastapi/run.py --port 8333
 ```
 
-如果项目根目录 `.env` 里配置了 `ENV_BOT_TOKEN` 和 `ENV_BOT_SECRET`，运行 `fastapi/run.py` 时也会一并启动 Telegram bot polling，不需要再额外开一个 `python telegram_bot.py` 进程。
+浏览器打开 `http://127.0.0.1:8000/`，输入独立的 Web 访问密钥。登录成功后使用 HttpOnly、SameSite=Strict Cookie 保持会话。
 
-3) 打开浏览器访问：`http://127.0.0.1:8000/`
-   如果用了 `--port 8333`，则访问 `http://127.0.0.1:8333/`
+## 功能与安全边界
 
-### 认证与代理
-- 认证：
-  - 页面表单可在 `Gemini API Key` 和 `Vertex AI service account JSON` 之间切换；
-  - Gemini 模式可直接填写 API Key，或使用环境变量 `GOOGLE_API_KEY`（或 `GEMINI_API_KEY`）；
-  - Vertex 模式可上传 service account JSON，并填写 `project id` / `location`，或依赖 `GOOGLE_APPLICATION_CREDENTIALS` / `VERTEX_SERVICE_ACCOUNT_FILE`。
-- 代理：
-  - 默认读取系统环境变量 `HTTP_PROXY/HTTPS_PROXY`；
-  - 页面表单支持覆盖：`代理（统一）/HTTP 代理/HTTPS 代理`。
+- 支持音频上传、YouTube、视频/音频直链和抖音分享内容。
+- `/api/transcribe`、任务状态/取消、WebSocket、文件列表、下载和清理接口均要求同一 Web 会话。
+- 上传文件在请求结束前按块复制到服务端拥有的临时文件，并执行大小限制和文件名净化。
+- 直链仅允许 HTTP/HTTPS 公网地址；每次重定向都会重新校验，并受字节、连接、读取与任务总超时限制。
+- 任务结束后 WebSocket 主动关闭；终态任务和结果会定期清理。
+- 浏览器 localStorage 只保存主题，不保存凭据或任务表单。
 
-### 端点
-- `GET /`：主页（可视化页面）
-- `POST /api/transcribe`：提交转写任务（表单）
-- `WS /ws/{job_id}`：任务进度与分片文本实时推送（WebSocket）
-- `GET /download/{filename}`：下载转写结果（仅限 `./data` 目录内文件）
-- `GET /health`：健康检查
+## Telegram 嵌入模式
 
-### 依赖说明
-- 必需：`fastapi`、`uvicorn`、`python-multipart`、`jinja2`
-- 已与 `pydantic`、`starlette` 版本匹配（见根目录 `requirements.txt`）
-- 建议安装：`ffmpeg`（用于视频直链抽取音频）
-- 抖音路径依赖第三方 `downcats.com`，其可用性受外部网络与站点变化影响
+推荐独立运行：
 
-### 使用提示
-- 本地音频：选择“本地音频文件”并上传；
-- YouTube：粘贴公开视频链接；
-- 视频直链：粘贴视频 URL（需 `ffmpeg` 抽音）；
-- 抖音：粘贴分享口令或短链，系统会解析 MP3 直链后下载；
-- 语言提示：填写 `zh/en/ja` 等，辅助模型更稳地识别语种；
-- 模型：默认 `gemini-2.5-flash`，可在页面调整。
+```bash
+python telegram_bot.py
+```
 
-### 常见问题
-- 端口占用：使用 `python fastapi/run.py --port 8333` 或设置环境变量 `PORT=8333`，或者关闭占用进程；
-- 无法导入依赖：再次执行 `python -m pip install -r requirements.txt`；
-- Telegram `/start` 没反应：确认当前是通过 `python fastapi/run.py` 或 `python telegram_bot.py` 启动，且 `.env` 中已配置有效的 `ENV_BOT_TOKEN` / `ENV_BOT_SECRET`；验证通过后请使用 Telegram 左下角命令菜单，`/setauth` 和 `/setsource` 触发后直接按提示回复参数；
-- `ffmpeg` 未安装：视频直链将无法抽音，请安装并加入 PATH；
-- 无进度/无分片：确认已重启服务，且网络/代理可访问外部站点与 Gemini；
-- 抖音失败：可能为 Tiksave 接口变化或网络受限，请更换网络或来源方式。
+确需由本地 Web 进程同时启动 Telegram polling 时，必须同时设置：
 
-### 安全与边界
-- 下载接口仅允许 `./data` 目录下的文件；
-- 请遵守各网站服务条款与当地法律，合理合法使用本工具。
+```dotenv
+WEB_ENABLED=true
+TELEGRAM_EMBEDDED_ENABLED=true
+```
+
+Vercel 入口始终禁用嵌入式 Telegram polling。
+
+## 主要端点
+
+- `GET /health`：返回 `enabled`、`disabled` 或 `misconfigured` 状态
+- `GET|POST /login`：Web 访问密钥登录
+- `POST /api/transcribe`：创建任务
+- `GET /api/jobs/{job_id}`：任务状态
+- `POST /api/jobs/{job_id}/cancel`：取消任务
+- `WS /ws/{job_id}`：状态与最终结果事件
+- `GET /download/{filename}`：下载结果
+- `GET /api/files`、`POST /api/cleanup`：受保护的结果管理
+
+请遵守来源网站服务条款与当地法律。视频抽音需要系统安装 `ffmpeg`。
