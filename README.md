@@ -86,10 +86,11 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
   - IDs in `TG_ALLOWED_USER_IDS` enter directly; other private-chat users enter the password once. Changing the password invalidates old password grants
   - Send audio, voice, YouTube, Douyin share text, or a public media URL directly; source type is detected automatically
   - `/settings` uses inline buttons for the global Gemini key pool, model, Prompt, language, and advanced Vertex settings
-  - `/settings` → “测试当前渠道” sends only `hi` with `gemini-2.5-flash-lite` and reports channel availability, region, and latency without exposing the response or credentials
+  - `/settings` → “测试当前渠道” sends only `hi` with the currently configured model and reports channel availability, region, and latency without exposing the response or credentials
+  - The model menu remotely lists transcription-compatible models from the current Gemini or Vertex channel; manual model entry remains available
   - Saving Vertex JSON/project/location automatically runs the same Vertex probe; a blank location defaults to `global`
   - `GOOGLE_API_KEYS` and Telegram input accept comma-separated keys. Tasks rotate healthy keys and skip keys in cooldown/disabled state
-  - Jobs are queued, cancellable, retryable, and use one compact status message. Results are sent as text/preview plus `.txt`
+  - Jobs are queued, cancellable, retryable, and use one compact status message. Long results are sent completely across multiple Telegram messages plus `.txt`, without preview truncation
   - Failures identify the stage (parsing, download, audio extraction, transcription, or delivery); protected server logs record one sanitized diagnostic line per failed job
   - The bot supports private chats only. The command menu contains `/start`, `/settings`, `/help`, and `/cancel`
   - Run embedded polling only when both `WEB_ENABLED=true` and `TELEGRAM_EMBEDDED_ENABLED=true`; otherwise run `telegram_bot.py` separately
@@ -264,10 +265,11 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
   - `TG_ALLOWED_USER_IDS` 中的账号直接进入；其他私聊用户输入一次 `ENV_BOT_SECRET`。服务端密码变化后旧授权自动失效
   - 直接发送音频、语音、YouTube、抖音分享文案或公网媒体直链，机器人会自动识别来源
   - `/settings` 使用消息内按钮管理全局 Key 池、模型、Prompt、语言及 Vertex 高级设置
-  - `/settings` 中的“测试当前渠道”会固定使用 `gemini-2.5-flash-lite` 发送一句 `hi`，仅返回渠道可用性、地区和耗时，不展示响应正文或凭据
+  - `/settings` 中的“测试当前渠道”会使用当前配置模型发送一句 `hi`，仅返回渠道可用性、地区和耗时，不展示响应正文或凭据
+  - 模型菜单会从当前 Gemini 或 Vertex 渠道远程读取适合转写的模型，仍保留手动输入模型名
   - 保存 Vertex JSON、Project 或 Location 后会自动执行同样的 Vertex 测活；Location 留空时默认使用 `global`
   - `GOOGLE_API_KEYS` 和 Telegram 输入都支持逗号分隔多 Key；任务会健康轮询并跳过限流、额度不足或失效 Key
-  - 任务支持排队、取消和重试；过程中只更新一条状态消息，完成后发送文本/预览与 `.txt`
+  - 任务支持排队、取消和重试；过程中只更新一条状态消息，长文本会拆成多条 Telegram 消息完整发送，并附带 `.txt`，不再截断预览
   - 失败消息会指出解析、下载、抽音、转写或结果发送阶段；受保护的服务日志为每个失败任务记录一条脱敏诊断
   - 仅支持私聊；命令菜单只包含 `/start`、`/settings`、`/help`、`/cancel`
   - 只有同时设置 `WEB_ENABLED=true` 与 `TELEGRAM_EMBEDDED_ENABLED=true` 才会随 Web 启动嵌入式 polling

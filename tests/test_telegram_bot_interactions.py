@@ -12,11 +12,15 @@ from key_pool import GeminiKeyPool
 from service_config import GlobalConfigStore
 from telegram_bot import (
     JobExecutionFailure,
+    MODEL_CHOICES_KEY,
     PENDING_ACTION_KEY,
+    ResultCache,
+    _deliver_result,
     _execute_job,
     _handle_setting_input,
     _on_job_update,
     build_application,
+    handle_callback_query,
     handle_text_message,
     start_command,
 )
@@ -152,7 +156,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
             return ChannelHealthResult(
                 available=True,
                 auth_mode=settings.auth_mode,
-                model="gemini-2.5-flash-lite",
+                model=settings.model_name,
                 location=settings.vertex_location,
                 latency_ms=10,
                 code="ok",
@@ -197,7 +201,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
             return ChannelHealthResult(
                 available=False,
                 auth_mode=settings.auth_mode,
-                model="gemini-2.5-flash-lite",
+                model=settings.model_name,
                 location=settings.vertex_location,
                 latency_ms=10,
                 code="permission_denied",
@@ -221,6 +225,89 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[-1].auth_mode, "vertex_ai_json")
         self.assertEqual(captured[-1].vertex_project, "new-project")
         self.assertEqual(captured[-1].vertex_location, "global")
+
+    async def test_vertex_model_menu_loads_remote_catalog(self):
+        captured = []
+
+        def loader(settings, pool):
+            captured.append(settings)
+            return ["gemini-current", "gemini-next"]
+
+        self.config_store.update(
+            auth_mode="vertex_ai_json",
+            vertex_json='{"project_id":"demo"}',
+            vertex_project="demo",
+            vertex_location="global",
+            model_name="gemini-current",
+        )
+        self.bot_data.update(
+            {
+                "allowed_user_ids": {42},
+                "job_manager": SimpleNamespace(),
+                "model_catalog_loader": loader,
+            }
+        )
+        context = FakeContext(self.bot_data)
+        query = SimpleNamespace(
+            data="settings:model",
+            message=FakeMessage(),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+
+        await handle_callback_query(update, context)
+
+        self.assertEqual(captured[-1].auth_mode, "vertex_ai_json")
+        self.assertEqual(
+            context.user_data[MODEL_CHOICES_KEY],
+            ["gemini-current", "gemini-next"],
+        )
+        rendered = query.edit_message_text.await_args
+        self.assertIn("gemini-current", rendered.args[0])
+        callbacks = [
+            button.callback_data
+            for row in rendered.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("model:set:0", callbacks)
+        self.assertIn("model:manual", callbacks)
+
+    async def test_model_menu_falls_back_to_manual_without_raw_error(self):
+        def loader(settings, pool):
+            raise RuntimeError("secret provider response")
+
+        self.config_store.update(auth_mode="vertex_ai_json")
+        self.bot_data.update(
+            {
+                "allowed_user_ids": {42},
+                "job_manager": SimpleNamespace(),
+                "model_catalog_loader": loader,
+            }
+        )
+        context = FakeContext(self.bot_data)
+        message = FakeMessage()
+        query = SimpleNamespace(
+            data="settings:model",
+            message=message,
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+
+        await handle_callback_query(update, context)
+
+        self.assertEqual(context.user_data[PENDING_ACTION_KEY], "model_manual")
+        self.assertIn("直接发送模型名称", message.replies[-1][0])
+        self.assertNotIn("secret provider response", message.replies[-1][0])
 
     async def test_execute_job_delivers_before_returning_success(self):
         class FakeService:
@@ -313,6 +400,44 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.stage, "delivering")
         self.assertNotIn("token=secret", str(raised.exception))
+
+    async def test_long_result_is_sent_in_full_across_multiple_messages(self):
+        transcript = "第一段。" * 1000 + "\n\n" + "🙂" * 1500
+        bot = SimpleNamespace(
+            send_message=AsyncMock(),
+            send_document=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        cache = ResultCache()
+        application = SimpleNamespace(
+            bot=bot,
+            bot_data={
+                "result_cache": cache,
+                "paths": SimpleNamespace(outputs_dir=self.root),
+            },
+        )
+        job = TelegramJob(
+            job_id="long-result",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="youtube",
+        )
+
+        await _deliver_result(
+            application,
+            job,
+            TranscriptionResult(transcript, "long-transcript"),
+        )
+
+        sent_chunks = [
+            call.kwargs["text"] for call in bot.send_message.await_args_list
+        ]
+        self.assertGreater(len(sent_chunks), 1)
+        self.assertEqual("".join(sent_chunks), transcript)
+        self.assertNotIn("完整内容见", "".join(sent_chunks))
+        self.assertEqual(cache.get(job.job_id), transcript)
+        bot.send_document.assert_awaited_once()
 
     async def test_terminal_timeout_logs_one_safe_structured_record(self):
         application = SimpleNamespace(

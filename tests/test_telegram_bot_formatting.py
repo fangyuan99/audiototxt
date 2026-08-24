@@ -5,6 +5,7 @@ from key_pool import GeminiKeyPool
 from service_config import GlobalSettings
 from telegram_bot import (
     BOT_COMMANDS,
+    MAX_TELEGRAM_TEXT,
     ResultCache,
     build_help_text,
     build_home_keyboard,
@@ -13,6 +14,7 @@ from telegram_bot import (
     render_channel_health,
     render_job_failure,
     render_settings,
+    split_telegram_text,
 )
 
 
@@ -77,11 +79,11 @@ class TelegramBotFormattingTest(unittest.TestCase):
             <= settings_callbacks
         )
 
-    def test_health_result_names_fixed_model_and_never_renders_log_detail(self):
+    def test_health_result_names_current_model_and_never_renders_log_detail(self):
         success = ChannelHealthResult(
             available=True,
             auth_mode="vertex_ai_json",
-            model="gemini-2.5-flash-lite",
+            model="gemini-current",
             location="global",
             latency_ms=123,
             code="ok",
@@ -90,7 +92,7 @@ class TelegramBotFormattingTest(unittest.TestCase):
         failure = ChannelHealthResult(
             available=False,
             auth_mode="vertex_ai_json",
-            model="gemini-2.5-flash-lite",
+            model="gemini-current",
             location="global",
             latency_ms=456,
             code="billing_disabled",
@@ -103,12 +105,13 @@ class TelegramBotFormattingTest(unittest.TestCase):
         rendered_failure = render_channel_health(failure)
 
         self.assertIn("当前渠道可用", rendered_success)
-        self.assertIn("gemini-2.5-flash-lite", rendered_success)
+        self.assertIn("gemini-current", rendered_success)
         self.assertIn("global", rendered_success)
         self.assertIn("当前渠道不可用", rendered_failure)
         self.assertIn("未启用结算", rendered_failure)
         self.assertNotIn("secret.example", rendered_failure)
         self.assertNotIn("token=", rendered_failure)
+        self.assertNotIn("本次未测试", rendered_success)
 
     def test_failure_renderer_includes_safe_localized_stage(self):
         rendered = render_job_failure(
@@ -145,6 +148,30 @@ class TelegramBotFormattingTest(unittest.TestCase):
         self.assertEqual(cache.get("three"), "abcd")
         now[0] += 11
         self.assertIsNone(cache.get("three"))
+
+    def test_result_cache_keeps_one_oversized_result_without_truncating(self):
+        cache = ResultCache(max_entries=2, max_characters=8)
+        transcript = "完整结果" * 10
+
+        cache.put("large", transcript)
+
+        self.assertEqual(cache.get("large"), transcript)
+
+    def test_split_telegram_text_preserves_every_character(self):
+        transcript = "甲" * 2900 + "\n\n" + "乙" * 2500 + "🙂" * 900
+
+        chunks = split_telegram_text(transcript)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual("".join(chunks), transcript)
+        self.assertTrue(chunks[0].endswith("\n\n"))
+        self.assertTrue(
+            all(
+                sum(2 if ord(character) > 0xFFFF else 1 for character in chunk)
+                <= MAX_TELEGRAM_TEXT
+                for chunk in chunks
+            )
+        )
 
 
 if __name__ == "__main__":

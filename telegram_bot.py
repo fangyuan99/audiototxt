@@ -59,6 +59,7 @@ from media_policy import (
     extract_first_url,
     sanitize_upload_name,
 )
+from model_catalog import list_current_channel_models
 from retention import (
     cleanup_expired_media,
     cleanup_expired_outputs,
@@ -66,6 +67,7 @@ from retention import (
 )
 from service_config import (
     BotPaths,
+    DEFAULT_MODEL_NAME,
     GlobalConfigStore,
     GlobalSettings,
     migrate_legacy_user_settings,
@@ -89,8 +91,6 @@ PENDING_ACTION_KEY = "pending_action"
 PENDING_AMBIGUOUS_KEY = "pending_ambiguous"
 MODEL_CHOICES_KEY = "model_choices"
 MAX_TELEGRAM_TEXT = 3800
-SHORT_TRANSCRIPT_LIMIT = 3200
-TRANSCRIPT_PREVIEW_LIMIT = 700
 MODEL_PAGE_SIZE = 6
 
 STAGE_LABELS = {
@@ -115,6 +115,63 @@ BOT_COMMANDS = [
 
 def html_code(value: str) -> str:
     return f"<code>{escape(str(value))}</code>"
+
+
+def split_telegram_text(
+    value: str,
+    *,
+    max_units: int = MAX_TELEGRAM_TEXT,
+) -> list[str]:
+    """Split text without loss, preferring paragraph and sentence boundaries."""
+    text = value or ""
+    if not text:
+        return []
+    if max_units < 2:
+        raise ValueError("max_units must be at least 2")
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        hard_end = start
+        units = 0
+        while hard_end < len(text):
+            character_units = 2 if ord(text[hard_end]) > 0xFFFF else 1
+            if units + character_units > max_units:
+                break
+            units += character_units
+            hard_end += 1
+
+        if hard_end >= len(text):
+            chunks.append(text[start:])
+            break
+
+        window = text[start:hard_end]
+        minimum_break = max(1, len(window) // 2)
+        split_at = 0
+        for marker in (
+            "\n\n",
+            "\n",
+            "。",
+            "！",
+            "？",
+            ". ",
+            "! ",
+            "? ",
+            "；",
+            "; ",
+            " ",
+        ):
+            marker_at = window.rfind(marker, minimum_break)
+            if marker_at >= 0:
+                split_at = marker_at + len(marker)
+                break
+        if split_at <= 0:
+            split_at = len(window)
+
+        chunks.append(window[:split_at])
+        start += split_at
+
+    return chunks
 
 
 class ResultCache:
@@ -143,7 +200,10 @@ class ResultCache:
             self._characters -= len(value)
         while self._items and (
             len(self._items) > self.max_entries
-            or self._characters > self.max_characters
+            or (
+                self._characters > self.max_characters
+                and len(self._items) > 1
+            )
         ):
             _key, (_expires, value) = self._items.popitem(last=False)
             self._characters -= len(value)
@@ -154,8 +214,6 @@ class ResultCache:
             previous = self._items.pop(key, None)
             if previous is not None:
                 self._characters -= len(previous[1])
-            if len(text) > self.max_characters:
-                text = text[: self.max_characters]
             self._items[key] = (self.clock() + self.ttl_seconds, text)
             self._characters += len(text)
             self._evict_locked()
@@ -333,7 +391,7 @@ def build_result_keyboard(job_id: str, *, include_full: bool) -> InlineKeyboardM
     rows = []
     if include_full:
         rows.append(
-            [InlineKeyboardButton("发送完整文本", callback_data=f"result:full:{job_id}")]
+            [InlineKeyboardButton("重新发送完整文本", callback_data=f"result:full:{job_id}")]
         )
     rows.append([InlineKeyboardButton("返回首页", callback_data="home")])
     return InlineKeyboardMarkup(rows)
@@ -415,8 +473,6 @@ def render_channel_health(
             f"结果：{escape(result.user_message)}",
         ]
     )
-    if settings is not None and settings.model_name != result.model:
-        lines.append(f"当前转写模型：{html_code(settings.model_name)}（本次未测试）")
     return "\n".join(lines)
 
 
@@ -605,23 +661,6 @@ def _validate_api_key(api_key: str) -> bool:
         client.close()
 
 
-def _list_models_for_key(api_key: str) -> list[str]:
-    config = build_auth_config(auth_mode=AUTH_MODE_GEMINI_API_KEY, api_key=api_key)
-    client = build_genai_client(config, timeout_seconds=20)
-    try:
-        result = []
-        for model in client.models.list(config={"page_size": 100}):
-            actions = [str(item).lower() for item in (getattr(model, "supported_actions", None) or [])]
-            if actions and not any("generatecontent" in action for action in actions):
-                continue
-            name = str(getattr(model, "name", "") or "").strip()
-            if name:
-                result.append(name)
-        return result
-    finally:
-        client.close()
-
-
 async def _run_channel_health_check(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -642,7 +681,7 @@ async def _run_channel_health_check(
         result = ChannelHealthResult(
             available=False,
             auth_mode=settings.auth_mode,
-            model="gemini-2.5-flash-lite",
+            model=settings.model_name.strip() or DEFAULT_MODEL_NAME,
             location=(
                 settings.vertex_location or "global"
                 if settings.auth_mode == AUTH_MODE_VERTEX_AI_JSON
@@ -676,11 +715,12 @@ async def _report_channel_health(
     *,
     settings_override: Optional[GlobalSettings] = None,
 ) -> ChannelHealthResult:
+    settings = settings_override or context.application.bot_data["config_store"].get()
+    model_name = settings.model_name.strip() or DEFAULT_MODEL_NAME
     progress = await _reply_html(
         message,
-        "<b>正在测试渠道</b>\n使用 gemini-2.5-flash-lite 发送 hi……",
+        f"<b>正在测试渠道</b>\n使用 {html_code(model_name)} 发送 hi……",
     )
-    settings = settings_override or context.application.bot_data["config_store"].get()
     result = await _run_channel_health_check(
         context, settings_override=settings_override
     )
@@ -793,9 +833,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if data == "channel:test":
         settings = config_store.get()
+        model_name = settings.model_name.strip() or DEFAULT_MODEL_NAME
         await _edit_query(
             query,
-            "<b>正在测试当前渠道</b>\n使用 gemini-2.5-flash-lite 发送 hi……",
+            f"<b>正在测试当前渠道</b>\n使用 {html_code(model_name)} 发送 hi……",
             build_settings_keyboard(),
         )
         result = await _run_channel_health_check(context)
@@ -826,22 +867,30 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if data == "settings:model":
         settings = config_store.get()
-        if settings.auth_mode == AUTH_MODE_VERTEX_AI_JSON:
-            context.user_data[PENDING_ACTION_KEY] = "model_manual"
-            await query.message.reply_text("Vertex 模式请直接发送模型名称。")
-            return
-        key_pool.sync(settings.gemini_api_keys)
         try:
             models = await asyncio.to_thread(
-                key_pool.list_models,
-                context.application.bot_data.get("model_loader", _list_models_for_key),
+                context.application.bot_data.get(
+                    "model_catalog_loader", list_current_channel_models
+                ),
+                settings,
+                key_pool,
             )
-        except Exception:
+        except Exception as exc:
+            diagnosis = diagnose_exception(exc)
+            logger.warning(
+                "model_catalog_failed auth_mode=%s category=%s error_type=%s detail=%s",
+                settings.auth_mode,
+                diagnosis.code,
+                diagnosis.error_type,
+                diagnosis.log_detail or "-",
+            )
             models = []
         context.user_data[MODEL_CHOICES_KEY] = models
         if not models:
             context.user_data[PENDING_ACTION_KEY] = "model_manual"
-            await query.message.reply_text("无法读取模型列表，请直接发送模型名称。")
+            await query.message.reply_text(
+                "无法从当前渠道读取可用模型，请直接发送模型名称。"
+            )
             return
         await _edit_query(
             query,
@@ -980,10 +1029,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if transcript is None:
             await query.message.reply_text("结果已过期，请重新转写。")
             return
-        for start in range(0, len(transcript), MAX_TELEGRAM_TEXT):
+        for chunk in split_telegram_text(transcript):
             await context.bot.send_message(
                 chat_id=job.chat_id,
-                text=transcript[start : start + MAX_TELEGRAM_TEXT],
+                text=chunk,
             )
         return
 
@@ -1411,19 +1460,20 @@ async def _deliver_result(
     cache: ResultCache = application.bot_data["result_cache"]
     cache.put(job.job_id, result.transcript)
     transcript = result.transcript or ""
-    is_long = len(transcript) > SHORT_TRANSCRIPT_LIMIT
+    transcript_chunks = split_telegram_text(transcript)
+    is_long = len(transcript_chunks) > 1
     paths: BotPaths = application.bot_data["paths"]
-    output_path = paths.outputs_dir / f"{job.job_id}_{sanitize_upload_name(result.filename_stem, default='transcript')}.txt"
+    output_path = paths.outputs_dir / (
+        f"{job.job_id}_"
+        f"{sanitize_upload_name(result.filename_stem, default='transcript')}.txt"
+    )
     delivered = False
     try:
-        if is_long:
-            preview = transcript[:TRANSCRIPT_PREVIEW_LIMIT].rstrip()
+        for chunk in transcript_chunks:
             await application.bot.send_message(
                 chat_id=job.chat_id,
-                text=f"{preview}\n\n……（完整内容见 txt 文件）",
+                text=chunk,
             )
-        elif transcript:
-            await application.bot.send_message(chat_id=job.chat_id, text=transcript)
         output_path.write_text(transcript, encoding="utf-8")
         with output_path.open("rb") as handle:
             await application.bot.send_document(
@@ -1658,7 +1708,7 @@ def build_application() -> Application:
             "allowed_user_ids": allowed_user_ids,
             "bot_secret": secret,
             "key_validator": _validate_api_key,
-            "model_loader": _list_models_for_key,
+            "model_catalog_loader": list_current_channel_models,
             "channel_health_checker": check_current_channel,
             "services_started": False,
         }

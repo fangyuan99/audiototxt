@@ -13,10 +13,9 @@ from main import (
     build_auth_config,
     build_genai_client,
 )
-from service_config import GlobalSettings
+from service_config import DEFAULT_MODEL_NAME, GlobalSettings
 
 
-HEALTH_CHECK_MODEL = "gemini-2.5-flash-lite"
 HEALTH_CHECK_PROMPT = "hi"
 MAX_LOG_DETAIL = 600
 
@@ -195,6 +194,7 @@ def check_current_channel(
     clock: Callable[[], float] = time.monotonic,
 ) -> ChannelHealthResult:
     started = clock()
+    probe_model = settings.model_name.strip() or DEFAULT_MODEL_NAME
     location = (
         settings.vertex_location.strip() or "global"
         if settings.auth_mode == AUTH_MODE_VERTEX_AI_JSON
@@ -212,7 +212,7 @@ def check_current_channel(
         client = client_factory(config, timeout_seconds=timeout_seconds)
         try:
             response = client.models.generate_content(
-                model=HEALTH_CHECK_MODEL,
+                model=probe_model,
                 contents=HEALTH_CHECK_PROMPT,
             )
             response_text = (getattr(response, "text", "") or "").strip()
@@ -234,7 +234,7 @@ def check_current_channel(
         return ChannelHealthResult(
             available=False,
             auth_mode=settings.auth_mode,
-            model=HEALTH_CHECK_MODEL,
+            model=probe_model,
             location=location,
             latency_ms=max(0, round((clock() - started) * 1000)),
             code=diagnosis.code,
@@ -246,7 +246,7 @@ def check_current_channel(
     return ChannelHealthResult(
         available=True,
         auth_mode=settings.auth_mode,
-        model=HEALTH_CHECK_MODEL,
+        model=probe_model,
         location=location,
         latency_ms=max(0, round((clock() - started) * 1000)),
         code="ok",

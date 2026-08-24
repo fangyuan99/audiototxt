@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 
 from channel_health import (
-    HEALTH_CHECK_MODEL,
     EmptyChannelResponse,
     check_current_channel,
     diagnose_exception,
@@ -37,7 +36,7 @@ class StatusError(RuntimeError):
 
 
 class ChannelHealthTest(unittest.TestCase):
-    def test_vertex_probe_uses_fixed_model_hi_and_global(self):
+    def test_vertex_probe_uses_current_model_hi_and_global(self):
         client = FakeClient(text="Hi there")
         captured = {}
 
@@ -51,7 +50,7 @@ class ChannelHealthTest(unittest.TestCase):
             vertex_json='{"project_id":"demo"}',
             vertex_project="demo",
             vertex_location="",
-            model_name="some-transcription-model",
+            model_name="gemini-current",
         )
         result = check_current_channel(
             settings,
@@ -61,10 +60,10 @@ class ChannelHealthTest(unittest.TestCase):
         )
 
         self.assertTrue(result.available)
-        self.assertEqual(result.model, HEALTH_CHECK_MODEL)
+        self.assertEqual(result.model, "gemini-current")
         self.assertEqual(result.location, "global")
         self.assertEqual(captured["config"].vertex_location, "global")
-        self.assertEqual(client.calls[0]["model"], "gemini-2.5-flash-lite")
+        self.assertEqual(client.calls[0]["model"], "gemini-current")
         self.assertEqual(client.calls[0]["contents"], "hi")
         self.assertTrue(client.closed)
 
