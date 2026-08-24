@@ -1010,6 +1010,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             retried = manager.retry(
                 job_id,
                 source_type_override=detected_source or job.source_type,
+                status_message_id=(
+                    getattr(query.message, "message_id", 0)
+                    or job.status_message_id
+                ),
             )
         except (ValueError, KeyError) as exc:
             await query.message.reply_text(str(exc))

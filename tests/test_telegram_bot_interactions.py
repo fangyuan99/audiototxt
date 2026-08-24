@@ -309,6 +309,58 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("直接发送模型名称", message.replies[-1][0])
         self.assertNotIn("secret provider response", message.replies[-1][0])
 
+    async def test_retry_binds_new_job_to_clicked_message(self):
+        original = TelegramJob(
+            job_id="failed-job",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="youtube",
+            text_input="https://www.youtube.com/watch?v=example",
+            status_message_id=12,
+            status="failed",
+        )
+        retried = TelegramJob(
+            job_id="retried-job",
+            sequence=2,
+            user_id=42,
+            chat_id=42,
+            source_type="youtube",
+        )
+        manager = SimpleNamespace(
+            get=lambda job_id: original if job_id == original.job_id else None,
+            retry=unittest.mock.Mock(return_value=retried),
+            queue_position=lambda job_id: 1,
+        )
+        self.bot_data.update(
+            {
+                "allowed_user_ids": {42},
+                "job_manager": manager,
+            }
+        )
+        context = FakeContext(self.bot_data)
+        message = FakeMessage()
+        message.message_id = 987
+        query = SimpleNamespace(
+            data=f"job:retry:{original.job_id}",
+            message=message,
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+
+        await handle_callback_query(update, context)
+
+        manager.retry.assert_called_once_with(
+            original.job_id,
+            source_type_override="youtube",
+            status_message_id=987,
+        )
+        self.assertIn("任务已重新排队", message.replies[-1][0])
+
     async def test_execute_job_delivers_before_returning_success(self):
         class FakeService:
             def execute(self, request, **kwargs):

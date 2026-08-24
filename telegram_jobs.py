@@ -369,6 +369,7 @@ class TelegramJobManager:
         job_id: str,
         *,
         source_type_override: Optional[str] = None,
+        status_message_id: Optional[int] = None,
     ) -> TelegramJob:
         original = self.get(job_id)
         if original is None:
@@ -387,6 +388,11 @@ class TelegramJobManager:
             audio_path=original.audio_path,
             original_filename=original.original_filename,
             source_message_id=original.source_message_id,
+            status_message_id=(
+                original.status_message_id
+                if status_message_id is None
+                else int(status_message_id or 0)
+            ),
             retry_of=original.job_id,
         )
 

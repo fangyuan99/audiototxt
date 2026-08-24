@@ -251,12 +251,30 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
         )
         manager._set_status(original.job_id, "failed", error_code="network")
 
-        retried = manager.retry(original.job_id)
+        retried = manager.retry(original.job_id, status_message_id=456)
 
         self.assertNotEqual(retried.job_id, original.job_id)
         self.assertEqual(retried.retry_of, original.job_id)
         self.assertEqual(retried.text_input, original.text_input)
         self.assertEqual(retried.status, "queued")
+        self.assertEqual(retried.status_message_id, 456)
+
+    async def test_retry_inherits_existing_status_message_by_default(self):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+        original = manager.enqueue(
+            user_id=1,
+            chat_id=2,
+            source_type="video_url",
+            text_input="https://example.com/v.mp4",
+            status_message_id=123,
+        )
+        manager._set_status(original.job_id, "failed", error_code="network")
+
+        retried = manager.retry(original.job_id)
+
+        self.assertEqual(retried.status_message_id, 123)
 
     async def test_retry_can_override_legacy_source_classification(self):
         manager = TelegramJobManager(
