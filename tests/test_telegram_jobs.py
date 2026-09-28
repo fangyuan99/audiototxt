@@ -342,6 +342,59 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(manager.get(recent.job_id))
         self.assertEqual(manager.get(active.job_id).status, "queued")
 
+    async def test_succeeded_jobs_can_outlive_other_terminal_jobs(self):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+        failed = manager.enqueue(user_id=1, chat_id=1, source_type="youtube")
+        done = manager.enqueue(user_id=1, chat_id=1, source_type="youtube")
+        three_days = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        manager._set_status(failed.job_id, "failed", updated_at=three_days)
+        manager._set_status(done.job_id, "succeeded", updated_at=three_days)
+
+        manager.prune_terminal(
+            max_age_seconds=24 * 3600, succeeded_max_age_seconds=7 * 86400
+        )
+
+        self.assertIsNone(manager.get(failed.job_id))
+        self.assertIsNotNone(manager.get(done.job_id))
+
+    async def test_content_key_scopes_reuse_to_user_source_and_settings(self):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+
+        def submit(user_id=1, identity="tg:abc", model="m1", **kwargs):
+            return manager.enqueue(
+                user_id=user_id,
+                chat_id=user_id,
+                source_type="audio",
+                telegram_file_id="file-id",
+                source_identity=identity,
+                settings_snapshot={"model_name": model},
+                **kwargs,
+            )
+
+        first = submit()
+        manager._set_status(first.job_id, "succeeded")
+        same = submit()
+        self.assertEqual(same.content_key, first.content_key)
+        self.assertNotEqual(submit(model="m2").content_key, first.content_key)
+        self.assertNotEqual(submit(user_id=2).content_key, first.content_key)
+        self.assertNotEqual(submit(identity="tg:other").content_key, first.content_key)
+        self.assertEqual(submit(identity="").content_key, "")
+
+        self.assertEqual(
+            manager.find_reusable(same, lambda job_id: True).job_id, first.job_id
+        )
+        self.assertIsNone(manager.find_reusable(same, lambda job_id: False))
+        fresh = manager.retry(first.job_id, force_fresh=True)
+        self.assertTrue(fresh.force_fresh)
+        self.assertEqual(fresh.content_key, first.content_key)
+        self.assertIsNone(manager.find_reusable(fresh, lambda job_id: True))
+        with self.assertRaises(ValueError):
+            manager.retry(first.job_id)
+
     async def test_delivery_progress_survives_restart(self):
         async def executor(job, cancelled):
             return "ok"

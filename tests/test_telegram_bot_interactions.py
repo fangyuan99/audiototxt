@@ -14,6 +14,7 @@ from channel_health import ChannelHealthResult
 from key_pool import GeminiKeyPool
 from service_config import GlobalConfigStore
 from telegram_bot import (
+    _history_text,
     render_job_progress,
     _settings_changed,
     build_failed_job_keyboard,
@@ -35,7 +36,7 @@ from telegram_bot import (
     start_command,
 )
 from telegram_delivery import ChatSender, ResultStore
-from telegram_jobs import TelegramJob
+from telegram_jobs import JobStore, TelegramJob, TelegramJobManager
 from transcription_service import TranscriptionResult
 
 
@@ -372,6 +373,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
             source_type_override="youtube",
             status_message_id=99,
             settings_snapshot_override=None,
+            force_fresh=False,
         )
         self.assertNotEqual(status_card.message_id, 987)
         self.assertIn("任务已重新排队", status_card.text)
@@ -629,6 +631,95 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         await handle_unsupported_message(make_update(message), FakeContext(self.bot_data))
 
         self.assertIn("暂不支持", message.replies[0][0])
+
+    def _real_manager_application(self, service, bot=None):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+        store = ResultStore(self.root / "results")
+        application = SimpleNamespace(
+            bot=bot or SimpleNamespace(edit_message_text=AsyncMock()),
+            bot_data={
+                **self.bot_data,
+                "transcription_service": service,
+                "media_policy": SimpleNamespace(task_timeout_seconds=10),
+                "job_manager": manager,
+                "result_store": store,
+                "allowed_user_ids": {42},
+            },
+        )
+        return manager, store, application
+
+    async def test_identical_request_reuses_stored_result(self):
+        class FakeService:
+            calls = 0
+
+            async def execute_async(self, request, **kwargs):
+                FakeService.calls += 1
+                return TranscriptionResult("fresh text", "fresh")
+
+        service = FakeService()
+        manager, store, application = self._real_manager_application(service)
+
+        def submit(**kwargs):
+            return manager.enqueue(
+                user_id=42, chat_id=42, source_type="youtube",
+                text_input="https://youtu.be/x", source_identity="text:https://youtu.be/x",
+                settings_snapshot={"model_name": "m1"}, **kwargs,
+            )
+
+        first = submit()
+        manager._set_status(first.job_id, "succeeded")
+        store.save(first.job_id, "old text", filename_stem="talk", finish_reason="STOP")
+
+        second = submit()
+        result = await _execute_job(application, manager.get(second.job_id), lambda: False)
+
+        self.assertEqual(FakeService.calls, 0)
+        self.assertEqual(result.transcript, "old text")
+        self.assertEqual(store.load(second.job_id).transcript, "old text")
+        self.assertEqual(manager.get(second.job_id).reused_from, first.job_id)
+        self.assertEqual(manager.get(second.job_id).delivery_status, "pending")
+
+        manager._set_status(second.job_id, "succeeded")
+        fresh = manager.retry(second.job_id, force_fresh=True)
+        result = await _execute_job(application, fresh, lambda: False)
+        self.assertEqual(FakeService.calls, 1)
+        self.assertEqual(result.transcript, "fresh text")
+
+    async def test_history_lists_results_and_delete_removes_them(self):
+        manager, store, application = self._real_manager_application(None)
+        kept = manager.enqueue(
+            user_id=42, chat_id=42, source_type="audio", original_filename="meeting.m4a"
+        )
+        expired = manager.enqueue(user_id=42, chat_id=42, source_type="youtube")
+        other_user = manager.enqueue(user_id=7, chat_id=7, source_type="youtube")
+        for job in (kept, expired, other_user):
+            manager._set_status(job.job_id, "succeeded")
+        store.save(kept.job_id, "text", filename_stem="meeting")
+        store.save(other_user.job_id, "text", filename_stem="x")
+
+        text, markup = _history_text(manager, store, 42)
+        self.assertIn("meeting.m4a", text)
+        self.assertNotIn(expired.job_id[:8], text)
+        self.assertNotIn(other_user.job_id[:8], text)
+        callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn(f"result:doc:{kept.job_id}", callbacks)
+
+        message = FakeMessage()
+        query = SimpleNamespace(
+            data=f"result:del:{kept.job_id}", message=message, answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+        await handle_callback_query(update, FakeContext(application.bot_data))
+
+        self.assertFalse(store.exists(kept.job_id))
+        self.assertEqual(manager.get(kept.job_id).delivery_status, "deleted")
 
     def _audio_job_application(self, service, bot):
         manager = SimpleNamespace(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -78,6 +79,13 @@ class TelegramJob:
     # Output settings (model, language, prompts) frozen at submit. Never
     # holds credentials.
     settings_snapshot: dict = field(default_factory=dict)
+    # What was transcribed: a Telegram file_unique_id or the submitted
+    # text. With the user and snapshot it forms content_key, which lets an
+    # identical request reuse a stored result unless force_fresh is set.
+    source_identity: str = ""
+    content_key: str = ""
+    force_fresh: bool = False
+    reused_from: str = ""
     # Delivery runs after the job succeeds: "", pending, sending, delivered
     # or failed. delivered_chunks lets a resend resume where it stopped.
     delivery_status: str = ""
@@ -95,6 +103,17 @@ class TelegramJob:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def compute_content_key(user_id: int, source_identity: str, snapshot: dict) -> str:
+    if not source_identity:
+        return ""
+    payload = json.dumps(
+        [int(user_id), source_identity, dict(sorted((snapshot or {}).items()))],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class JobStore:
@@ -239,8 +258,11 @@ class TelegramJobManager:
         status_message_id: int = 0,
         retry_of: str = "",
         settings_snapshot: Optional[dict] = None,
+        source_identity: str = "",
+        force_fresh: bool = False,
     ) -> TelegramJob:
         now = _utc_now()
+        snapshot = dict(settings_snapshot or {})
         with self._lock:
             self._check_capacity_locked(int(user_id))
             job = TelegramJob(
@@ -256,7 +278,10 @@ class TelegramJobManager:
                 source_message_id=int(source_message_id or 0),
                 status_message_id=int(status_message_id or 0),
                 retry_of=retry_of or "",
-                settings_snapshot=dict(settings_snapshot or {}),
+                settings_snapshot=snapshot,
+                source_identity=source_identity or "",
+                content_key=compute_content_key(user_id, source_identity, snapshot),
+                force_fresh=bool(force_fresh),
                 created_at=now,
                 updated_at=now,
             )
@@ -341,13 +366,20 @@ class TelegramJobManager:
         self,
         *,
         max_age_seconds: float = 24 * 3600,
+        succeeded_max_age_seconds: Optional[float] = None,
         now: Optional[datetime] = None,
     ) -> int:
+        """Drop old terminal jobs. Succeeded jobs may be kept longer so
+        their stored results stay reachable from the history list."""
         current = now or datetime.now(timezone.utc)
         if current.tzinfo is None:
             current = current.replace(tzinfo=timezone.utc)
-        cutoff = current.astimezone(timezone.utc).timestamp() - max(
-            0.0, float(max_age_seconds)
+        current_ts = current.astimezone(timezone.utc).timestamp()
+        cutoff = current_ts - max(0.0, float(max_age_seconds))
+        succeeded_cutoff = (
+            cutoff
+            if succeeded_max_age_seconds is None
+            else current_ts - max(0.0, float(succeeded_max_age_seconds))
         )
         terminal = {"succeeded", "failed", "cancelled", "interrupted"}
         with self._lock:
@@ -363,7 +395,8 @@ class TelegramJobManager:
                         updated = updated.replace(tzinfo=timezone.utc)
                 except ValueError:
                     continue
-                if updated.astimezone(timezone.utc).timestamp() < cutoff:
+                limit = succeeded_cutoff if job.status == "succeeded" else cutoff
+                if updated.astimezone(timezone.utc).timestamp() < limit:
                     expired.append(job_id)
             for job_id in expired:
                 self._jobs.pop(job_id, None)
@@ -429,6 +462,42 @@ class TelegramJobManager:
             # Per-chunk progress alone is not critical: losing it on a crash
             # only means a resend may repeat a chunk or two.
             self._persist_locked(critical=applied != {"delivered_chunks"})
+            return replace(job)
+
+    def find_reusable(
+        self,
+        job: TelegramJob,
+        has_result: Callable[[str], bool],
+    ) -> Optional[TelegramJob]:
+        """Newest earlier succeeded job with the same content key."""
+        if not job.content_key or job.force_fresh:
+            return None
+        with self._lock:
+            candidates = sorted(
+                (
+                    other
+                    for other in self._jobs.values()
+                    if other.job_id != job.job_id
+                    and other.status == "succeeded"
+                    and other.content_key == job.content_key
+                ),
+                key=lambda other: other.sequence,
+                reverse=True,
+            )
+            candidates = [replace(other) for other in candidates]
+        for candidate in candidates:
+            if has_result(candidate.job_id):
+                return candidate
+        return None
+
+    def mark_reused(self, job_id: str, source_job_id: str) -> Optional[TelegramJob]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            job.reused_from = source_job_id
+            job.updated_at = _utc_now()
+            self._persist_locked()
             return replace(job)
 
     def undelivered_jobs(self) -> list[TelegramJob]:
@@ -513,16 +582,23 @@ class TelegramJobManager:
         source_type_override: Optional[str] = None,
         status_message_id: Optional[int] = None,
         settings_snapshot_override: Optional[dict] = None,
+        force_fresh: bool = False,
     ) -> TelegramJob:
         """Re-enqueue a job, reusing its original settings snapshot unless
-        ``settings_snapshot_override`` is given."""
+        ``settings_snapshot_override`` is given.
+
+        ``force_fresh`` also accepts succeeded jobs and skips result reuse.
+        """
         # Hold the lock across the check and enqueue so repeated clicks
         # cannot create more than one active retry for the same job.
         with self._lock:
             original = self.get(job_id)
             if original is None:
                 raise KeyError(job_id)
-            if original.status not in {"failed", "cancelled", "interrupted"}:
+            allowed = {"failed", "cancelled", "interrupted"}
+            if force_fresh:
+                allowed.add("succeeded")
+            if original.status not in allowed:
                 raise ValueError("只有失败、取消或中断的任务可以重试。")
             existing = self.active_retry_of(job_id)
             if existing is not None:
@@ -558,6 +634,8 @@ class TelegramJobManager:
                     if settings_snapshot_override is None
                     else settings_snapshot_override
                 ),
+                source_identity=original.source_identity,
+                force_fresh=force_fresh,
             )
 
     async def start(self) -> None:

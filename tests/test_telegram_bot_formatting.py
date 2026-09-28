@@ -61,7 +61,7 @@ class TelegramBotFormattingTest(unittest.TestCase):
             for row in build_home_keyboard().inline_keyboard
             for button in row
         }
-        self.assertEqual(home_callbacks, {"home:status", "settings", "queue", "help"})
+        self.assertEqual(home_callbacks, {"home:status", "settings", "queue", "history", "help"})
 
         settings_callbacks = {
             button.callback_data

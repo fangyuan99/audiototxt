@@ -108,6 +108,29 @@ class ResultStore:
         )
 
 
+    def exists(self, job_id: str) -> bool:
+        try:
+            return all(path.is_file() for path in self._paths(job_id))
+        except ValueError:
+            return False
+
+    def delete(self, job_id: str) -> None:
+        for path in self._paths(job_id):
+            path.unlink(missing_ok=True)
+
+    def copy(self, source_job_id: str, target_job_id: str) -> Optional[StoredResult]:
+        stored = self.load(source_job_id)
+        if stored is None:
+            return None
+        self.save(
+            target_job_id,
+            stored.transcript,
+            filename_stem=stored.filename_stem,
+            finish_reason=stored.finish_reason,
+        )
+        return stored
+
+
 class DeliveryFailed(RuntimeError):
     pass
 

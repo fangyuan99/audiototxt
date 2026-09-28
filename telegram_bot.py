@@ -185,8 +185,9 @@ def build_home_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("📋 任务队列", callback_data="queue"),
-                InlineKeyboardButton("❓ 使用帮助", callback_data="help"),
+                InlineKeyboardButton("🗂 最近结果", callback_data="history"),
             ],
+            [InlineKeyboardButton("❓ 使用帮助", callback_data="help")],
         ]
     )
 
@@ -352,11 +353,17 @@ def build_resend_keyboard(job_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def build_result_keyboard(job_id: str, *, include_full: bool) -> InlineKeyboardMarkup:
+def build_result_keyboard(
+    job_id: str, *, include_full: bool, reused: bool = False
+) -> InlineKeyboardMarkup:
     rows = []
     if include_full:
         rows.append(
             [InlineKeyboardButton("重新发送完整文本", callback_data=f"result:full:{job_id}")]
+        )
+    if reused:
+        rows.append(
+            [InlineKeyboardButton("🔁 重新转写", callback_data=f"job:fresh:{job_id}")]
         )
     rows.append([InlineKeyboardButton("返回首页", callback_data="home")])
     return InlineKeyboardMarkup(rows)
@@ -752,6 +759,45 @@ async def _edit_query(query, text: str, markup: InlineKeyboardMarkup) -> None:
             raise
 
 
+HISTORY_LIMIT = 8
+
+
+def _history_text(
+    manager: TelegramJobManager, store: ResultStore, user_id: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    jobs = sorted(
+        (
+            job
+            for job in manager.snapshot()
+            if job.user_id == user_id
+            and job.status == "succeeded"
+            and store.exists(job.job_id)
+        ),
+        key=lambda job: job.sequence,
+        reverse=True,
+    )[:HISTORY_LIMIT]
+    if not jobs:
+        return "<b>最近结果</b>\n暂无可用结果（结果保留 7 天）。", build_home_keyboard()
+    lines = ["<b>最近结果</b>（保留 7 天）"]
+    rows = []
+    for job in jobs:
+        label = job.original_filename or job.text_input or job.source_type
+        if len(label) > 40:
+            label = label[:39] + "…"
+        when = (job.updated_at or "")[:16].replace("T", " ")
+        lines.append(f"• {html_code(job.job_id[:8])} · {escape(label)} · {escape(when)} UTC")
+        short = job.job_id[:8]
+        rows.append(
+            [
+                InlineKeyboardButton(f"重发 {short}", callback_data=f"result:resend:{job.job_id}"),
+                InlineKeyboardButton("📄 文件", callback_data=f"result:doc:{job.job_id}"),
+                InlineKeyboardButton("🗑 删除", callback_data=f"result:del:{job.job_id}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="home")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
 def _queue_text(manager: TelegramJobManager, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     jobs = [
         job
@@ -857,6 +903,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if data == "queue":
         text, markup = _queue_text(manager, user.id)
+        await _edit_query(query, text, markup)
+        return
+    if data == "history":
+        text, markup = _history_text(
+            manager, context.application.bot_data["result_store"], user.id
+        )
         await _edit_query(query, text, markup)
         return
     if data == "settings:keys":
@@ -1006,8 +1058,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         manager.cancel(job_id)
         await query.message.reply_text(f"已请求取消任务 {job_id[:8]}。")
         return
-    if data.startswith(("job:retry:", "job:retrycur:")):
+    if data.startswith(("job:retry:", "job:retrycur:", "job:fresh:")):
         use_current = data.startswith("job:retrycur:")
+        force_fresh = data.startswith("job:fresh:")
         job_id = data.split(":", 2)[-1]
         job = manager.get(job_id)
         if job is None or job.user_id != user.id:
@@ -1031,6 +1084,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     if use_current
                     else None
                 ),
+                force_fresh=force_fresh,
             )
         except (ValueError, KeyError) as exc:
             reason = str(exc) if isinstance(exc, ValueError) else "任务不存在。"
@@ -1044,20 +1098,41 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             build_cancel_job_keyboard(retried.job_id),
         )
         return
-    if data.startswith(("result:full:", "result:resend:")):
+    if data.startswith(("result:full:", "result:resend:", "result:doc:", "result:del:")):
         _prefix, action, job_id = data.split(":", 2)
         job = manager.get(job_id)
         if job is None or job.user_id != user.id or job.status != "succeeded":
             await query.message.reply_text("结果不存在或无权访问。")
             return
         store: ResultStore = context.application.bot_data["result_store"]
-        if store.load(job_id) is None:
+        stored = store.load(job_id)
+        if stored is None:
             await query.message.reply_text("结果已过期，请重新转写。")
+            return
+        delivering = context.application.bot_data.get("delivery_tasks", {}).get(job_id)
+        if action == "del":
+            if delivering is not None and not delivering.done():
+                await query.message.reply_text("结果正在发送中，请稍后再删除。")
+                return
+            store.delete(job_id)
+            manager.update_delivery(job_id, delivery_status="deleted")
+            text, markup = _history_text(manager, store, user.id)
+            await _edit_query(query, "已删除结果。\n\n" + text, markup)
             return
         if action == "full":
             # Resend the text messages only; the TXT file already arrived.
             changes = {"delivered_chunks": 0, "document_sent": True}
+        elif action == "doc":
+            # Send only the TXT file.
+            changes = {
+                "delivered_chunks": len(split_telegram_text(stored.transcript)),
+                "document_sent": False,
+            }
+        elif job.delivery_status == "delivered":
+            # Resending a finished delivery (e.g. from history) starts over.
+            changes = {"delivered_chunks": 0, "document_sent": False}
         else:
+            # A failed or interrupted delivery resumes where it stopped.
             changes = {}
         if not _schedule_delivery(context.application, job_id, **changes):
             await query.message.reply_text("结果正在发送中，请稍候。")
@@ -1255,8 +1330,11 @@ async def _enqueue_job(
     audio_path: str = "",
     telegram_file_id: str = "",
     original_filename: str = "",
+    source_identity: str = "",
 ) -> Optional[TelegramJob]:
     status_message = await _reply_html(message, "<b>已接收</b>\n正在加入任务队列……")
+    if not source_identity and text_input:
+        source_identity = f"text:{text_input.strip()}"
     manager: TelegramJobManager = context.application.bot_data["job_manager"]
     chat_id = getattr(getattr(message, "chat", None), "id", None)
     if chat_id is None:
@@ -1273,6 +1351,7 @@ async def _enqueue_job(
             source_message_id=getattr(message, "message_id", 0) or 0,
             status_message_id=getattr(status_message, "message_id", 0) or 0,
             settings_snapshot=_current_output_snapshot(context.application.bot_data),
+            source_identity=source_identity,
         )
     except QueueFull as exc:
         await _edit_message(
@@ -1370,6 +1449,11 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
         source_type="audio",
         telegram_file_id=source_file.file_id,
         original_filename=original,
+        source_identity=(
+            f"tg:{source_file.file_unique_id}"
+            if getattr(source_file, "file_unique_id", "")
+            else ""
+        ),
     )
 
 
@@ -1443,6 +1527,39 @@ _STATUS_LABELS = {
     "retrying": "临时失败，正在重试",
     "transcribing": "正在转写",
 }
+
+
+def _reuse_stored_result(
+    application: Application, job: TelegramJob
+) -> Optional[TranscriptionResult]:
+    """Serve an identical earlier request from its stored result.
+
+    Same user, same source and same output settings; skipped when the job
+    was explicitly submitted as a fresh transcription.
+    """
+    manager: TelegramJobManager = application.bot_data["job_manager"]
+    store: Optional[ResultStore] = application.bot_data.get("result_store")
+    find_reusable = getattr(manager, "find_reusable", None)
+    if store is None or not callable(find_reusable):
+        return None
+    previous = find_reusable(job, store.exists)
+    if previous is None:
+        return None
+    stored = store.copy(previous.job_id, job.job_id)
+    if stored is None:
+        return None
+    manager.mark_reused(job.job_id, previous.job_id)
+    manager.update_delivery(
+        job.job_id, delivery_status="pending", delivered_chunks=0, document_sent=False
+    )
+    cleanup = (Path(job.audio_path),) if job.audio_path else ()
+    _remove_paths(cleanup)
+    logger.info("telegram_job_reused job_id=%s source=%s", job.job_id, previous.job_id)
+    return TranscriptionResult(
+        stored.transcript,
+        stored.filename_stem,
+        finish_reason=stored.finish_reason,
+    )
 
 
 PROGRESS_EDIT_INTERVAL_SECONDS = 5.0
@@ -1550,6 +1667,10 @@ async def _execute_job(
     def close_card() -> None:
         with stage_lock:
             progress["closed"] = True
+
+    reused = _reuse_stored_result(application, job)
+    if reused is not None:
+        return reused
 
     try:
         if job.source_type == "audio" and (
@@ -1698,8 +1819,10 @@ def _schedule_delivery(application: Application, job_id: str, **changes) -> bool
     return True
 
 
-def render_result_completion(stored: StoredResult) -> str:
+def render_result_completion(stored: StoredResult, *, reused: bool = False) -> str:
     text = "<b>转写完成</b>\n结果已发送。"
+    if reused:
+        text += "\n♻️ 来源与配置相同，已直接复用之前的结果。需要重新生成可点“重新转写”。"
     if stored.incomplete:
         text += (
             f"\n⚠️ 结果可能不完整（结束原因：{html_code(stored.finish_reason)}），"
@@ -1781,8 +1904,10 @@ async def _deliver_job(application: Application, job_id: str) -> None:
     await _safe_edit_status(
         application,
         job,
-        render_result_completion(stored),
-        build_result_keyboard(job_id, include_full=len(chunks) > 1),
+        render_result_completion(stored, reused=bool(job.reused_from)),
+        build_result_keyboard(
+            job_id, include_full=len(chunks) > 1, reused=bool(job.reused_from)
+        ),
     )
 
 
@@ -1899,7 +2024,11 @@ async def _maintenance_loop(application: Application) -> None:
                 application.bot_data["paths"],
                 max_age_seconds=7 * 86400,
             )
-            manager.prune_terminal(max_age_seconds=24 * 3600)
+            # Succeeded jobs live as long as their stored results.
+            manager.prune_terminal(
+                max_age_seconds=24 * 3600,
+                succeeded_max_age_seconds=7 * 86400,
+            )
         except Exception:
             logger.exception("Telegram maintenance pass failed")
         await asyncio.sleep(3600)
