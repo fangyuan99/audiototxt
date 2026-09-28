@@ -308,6 +308,44 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "重新发送"):
             manager.retry(original.job_id)
 
+    async def test_retry_is_idempotent_while_retry_is_active(self):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+        original = manager.enqueue(
+            user_id=1,
+            chat_id=2,
+            source_type="video_url",
+            text_input="https://example.com/v.mp4",
+        )
+        manager._set_status(original.job_id, "failed", error_code="network")
+
+        first = manager.retry(original.job_id)
+        with self.assertRaisesRegex(ValueError, "已在重试中"):
+            manager.retry(original.job_id)
+
+        manager._set_status(first.job_id, "failed", error_code="network")
+        second = manager.retry(original.job_id)
+        self.assertNotEqual(second.job_id, first.job_id)
+
+    async def test_retry_audio_without_local_file_redownloads_by_file_id(self):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+        original = manager.enqueue(
+            user_id=1,
+            chat_id=2,
+            source_type="audio",
+            audio_path=str(self.root / "missing.mp3"),
+            telegram_file_id="file-123",
+        )
+        manager._set_status(original.job_id, "failed", error_code="network")
+
+        retried = manager.retry(original.job_id)
+
+        self.assertEqual(retried.telegram_file_id, "file-123")
+        self.assertEqual(retried.audio_path, "")
+
 
 if __name__ == "__main__":
     unittest.main()

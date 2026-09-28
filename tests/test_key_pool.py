@@ -76,6 +76,37 @@ class GeminiKeyPoolTest(unittest.TestCase):
             pool.run(operation)
         self.assertEqual(calls, ["key-a"])
 
+    def test_wrapped_rate_limit_still_rotates_to_next_key(self):
+        pool = GeminiKeyPool(["key-a", "key-b"], clock=self.clock)
+        calls = []
+
+        def operation(key):
+            calls.append(key)
+            if key == "key-a":
+                try:
+                    raise FakeHttpError(429, "quota exhausted")
+                except FakeHttpError as exc:
+                    raise RuntimeError("YouTube 直连转写失败") from exc
+            return key
+
+        self.assertEqual(pool.run(operation), "key-b")
+        self.assertEqual(calls, ["key-a", "key-b"])
+
+    def test_wrapped_deterministic_error_does_not_rotate(self):
+        pool = GeminiKeyPool(["key-a", "key-b"], clock=self.clock)
+        calls = []
+
+        def operation(key):
+            calls.append(key)
+            try:
+                raise FakeHttpError(400, "invalid media content")
+            except FakeHttpError as exc:
+                raise RuntimeError("YouTube 直连转写失败") from exc
+
+        with self.assertRaises(DeterministicGeminiError):
+            pool.run(operation)
+        self.assertEqual(calls, ["key-a"])
+
     def test_sync_reenables_changed_configuration(self):
         pool = GeminiKeyPool(["bad-key"], clock=self.clock)
         with self.assertRaises(KeyPoolExhausted):

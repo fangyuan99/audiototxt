@@ -64,6 +64,7 @@ class TelegramJob:
     source_type: str
     text_input: str = ""
     audio_path: str = ""
+    telegram_file_id: str = ""
     original_filename: str = ""
     source_message_id: int = 0
     status_message_id: int = 0
@@ -200,6 +201,7 @@ class TelegramJobManager:
         source_type: str,
         text_input: str = "",
         audio_path: str = "",
+        telegram_file_id: str = "",
         original_filename: str = "",
         source_message_id: int = 0,
         status_message_id: int = 0,
@@ -215,6 +217,7 @@ class TelegramJobManager:
                 source_type=source_type,
                 text_input=text_input or "",
                 audio_path=audio_path or "",
+                telegram_file_id=telegram_file_id or "",
                 original_filename=original_filename or "",
                 source_message_id=int(source_message_id or 0),
                 status_message_id=int(status_message_id or 0),
@@ -308,6 +311,27 @@ class TelegramJobManager:
             self.store.save(self._jobs)
             return replace(job)
 
+    def set_audio_path(self, job_id: str, audio_path: str) -> Optional[TelegramJob]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            job.audio_path = audio_path or ""
+            job.updated_at = _utc_now()
+            self.store.save(self._jobs)
+            return replace(job)
+
+    def active_retry_of(self, job_id: str) -> Optional[TelegramJob]:
+        with self._lock:
+            for job in self._jobs.values():
+                if job.retry_of == job_id and job.status in {
+                    "queued",
+                    "running",
+                    "cancelling",
+                }:
+                    return replace(job)
+            return None
+
     def update_stage(self, job_id: str, stage: str) -> Optional[TelegramJob]:
         normalized = _safe_stage(stage, default="")
         if not normalized:
@@ -371,30 +395,44 @@ class TelegramJobManager:
         source_type_override: Optional[str] = None,
         status_message_id: Optional[int] = None,
     ) -> TelegramJob:
-        original = self.get(job_id)
-        if original is None:
-            raise KeyError(job_id)
-        if original.status not in {"failed", "cancelled", "interrupted"}:
-            raise ValueError("只有失败、取消或中断的任务可以重试。")
-        if original.source_type == "audio" and (
-            not original.audio_path or not Path(original.audio_path).is_file()
-        ):
-            raise ValueError("原音频已过期，请重新发送文件。")
-        return self.enqueue(
-            user_id=original.user_id,
-            chat_id=original.chat_id,
-            source_type=source_type_override or original.source_type,
-            text_input=original.text_input,
-            audio_path=original.audio_path,
-            original_filename=original.original_filename,
-            source_message_id=original.source_message_id,
-            status_message_id=(
-                original.status_message_id
-                if status_message_id is None
-                else int(status_message_id or 0)
-            ),
-            retry_of=original.job_id,
-        )
+        # Hold the lock across the check and enqueue so repeated clicks
+        # cannot create more than one active retry for the same job.
+        with self._lock:
+            original = self.get(job_id)
+            if original is None:
+                raise KeyError(job_id)
+            if original.status not in {"failed", "cancelled", "interrupted"}:
+                raise ValueError("只有失败、取消或中断的任务可以重试。")
+            existing = self.active_retry_of(job_id)
+            if existing is not None:
+                raise ValueError(
+                    f"该任务已在重试中：{existing.job_id[:8]}，请勿重复提交。"
+                )
+            audio_available = bool(original.audio_path) and Path(
+                original.audio_path
+            ).is_file()
+            if (
+                original.source_type == "audio"
+                and not audio_available
+                and not original.telegram_file_id
+            ):
+                raise ValueError("原音频已过期，请重新发送文件。")
+            return self.enqueue(
+                user_id=original.user_id,
+                chat_id=original.chat_id,
+                source_type=source_type_override or original.source_type,
+                text_input=original.text_input,
+                audio_path=original.audio_path if audio_available else "",
+                telegram_file_id=original.telegram_file_id,
+                original_filename=original.original_filename,
+                source_message_id=original.source_message_id,
+                status_message_id=(
+                    original.status_message_id
+                    if status_message_id is None
+                    else int(status_message_id or 0)
+                ),
+                retry_of=original.job_id,
+            )
 
     async def start(self) -> None:
         if self._started:

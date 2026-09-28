@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from telegram.error import BadRequest
+
 from bot_state import BotStateStore
 from channel_health import ChannelHealthResult
 from key_pool import GeminiKeyPool
@@ -20,6 +22,8 @@ from telegram_bot import (
     _handle_setting_input,
     _on_job_update,
     build_application,
+    cancel_command,
+    handle_audio_message,
     handle_callback_query,
     handle_text_message,
     start_command,
@@ -309,7 +313,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("直接发送模型名称", message.replies[-1][0])
         self.assertNotIn("secret provider response", message.replies[-1][0])
 
-    async def test_retry_binds_new_job_to_clicked_message(self):
+    async def test_retry_binds_new_job_to_its_own_status_card(self):
         original = TelegramJob(
             job_id="failed-job",
             sequence=1,
@@ -354,12 +358,248 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
 
         await handle_callback_query(update, context)
 
+        status_card = message.replies[-1][2]
+        status_card.message_id = 555
         manager.retry.assert_called_once_with(
             original.job_id,
             source_type_override="youtube",
-            status_message_id=987,
+            status_message_id=99,
         )
-        self.assertIn("任务已重新排队", message.replies[-1][0])
+        self.assertNotEqual(status_card.message_id, 987)
+        self.assertIn("任务已重新排队", status_card.text)
+        self.assertEqual(message.edits, [])
+
+    async def test_duplicate_retry_reports_error_on_new_card(self):
+        original = TelegramJob(
+            job_id="failed-job",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="youtube",
+            text_input="https://www.youtube.com/watch?v=example",
+            status="failed",
+        )
+        manager = SimpleNamespace(
+            get=lambda job_id: original,
+            retry=unittest.mock.Mock(
+                side_effect=ValueError("该任务已在重试中：abcd1234，请勿重复提交。")
+            ),
+        )
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        context = FakeContext(self.bot_data)
+        message = FakeMessage()
+        query = SimpleNamespace(
+            data=f"job:retry:{original.job_id}",
+            message=message,
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+
+        await handle_callback_query(update, context)
+
+        self.assertIn("已在重试中", message.replies[-1][2].text)
+
+    async def test_navigation_ends_pending_input_so_link_is_transcribed(self):
+        manager = SimpleNamespace(
+            snapshot=lambda: [],
+            enqueue=unittest.mock.Mock(
+                return_value=TelegramJob(
+                    job_id="new-job",
+                    sequence=1,
+                    user_id=42,
+                    chat_id=42,
+                    source_type="youtube",
+                )
+            ),
+            queue_position=lambda job_id: 1,
+        )
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        context = FakeContext(self.bot_data)
+        context.user_data[PENDING_ACTION_KEY] = "prompt_append"
+        query = SimpleNamespace(
+            data="home",
+            message=FakeMessage(),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+
+        await handle_callback_query(update, context)
+        self.assertNotIn(PENDING_ACTION_KEY, context.user_data)
+
+        link = FakeMessage("https://www.youtube.com/watch?v=abc")
+        await handle_text_message(make_update(link), context)
+
+        manager.enqueue.assert_called_once()
+        self.assertEqual(self.config_store.get().prompt_append, "")
+
+    async def test_cancel_with_pending_input_does_not_cancel_job(self):
+        manager = SimpleNamespace(cancel=unittest.mock.Mock())
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        context = FakeContext(self.bot_data)
+        context.user_data[PENDING_ACTION_KEY] = "prompt_append"
+        message = FakeMessage("/cancel")
+
+        with patch("telegram_bot._latest_user_job") as latest:
+            await cancel_command(make_update(message), context)
+
+        latest.assert_not_called()
+        manager.cancel.assert_not_called()
+        self.assertNotIn(PENDING_ACTION_KEY, context.user_data)
+        self.assertIn("已退出输入", message.replies[-1][0])
+
+    async def test_audio_message_enqueues_without_downloading(self):
+        manager = SimpleNamespace(
+            enqueue=unittest.mock.Mock(
+                return_value=TelegramJob(
+                    job_id="audio-job",
+                    sequence=1,
+                    user_id=42,
+                    chat_id=42,
+                    source_type="audio",
+                )
+            ),
+            queue_position=lambda job_id: 1,
+        )
+        self.bot_data.update(
+            {
+                "allowed_user_ids": {42},
+                "job_manager": manager,
+                "media_policy": SimpleNamespace(max_media_bytes=100 * 1024 * 1024),
+            }
+        )
+        context = FakeContext(self.bot_data)
+        message = FakeMessage()
+        get_file = AsyncMock()
+        message.audio = SimpleNamespace(
+            file_id="file-abc",
+            file_size=1024,
+            file_name="meeting.m4a",
+            get_file=get_file,
+        )
+        message.voice = None
+        message.document = None
+
+        await handle_audio_message(make_update(message), context)
+
+        get_file.assert_not_awaited()
+        kwargs = manager.enqueue.call_args.kwargs
+        self.assertEqual(kwargs["telegram_file_id"], "file-abc")
+        self.assertEqual(kwargs["audio_path"], "")
+        self.assertIn("已接收", message.replies[0][0])
+
+    async def test_audio_over_bot_api_limit_is_rejected_immediately(self):
+        manager = SimpleNamespace(enqueue=unittest.mock.Mock())
+        self.bot_data.update(
+            {
+                "allowed_user_ids": {42},
+                "job_manager": manager,
+                "media_policy": SimpleNamespace(max_media_bytes=100 * 1024 * 1024),
+            }
+        )
+        context = FakeContext(self.bot_data)
+        message = FakeMessage()
+        message.audio = SimpleNamespace(
+            file_id="file-big", file_size=25 * 1024 * 1024, file_name="big.mp3"
+        )
+        message.voice = None
+        message.document = None
+
+        await handle_audio_message(make_update(message), context)
+
+        manager.enqueue.assert_not_called()
+        self.assertIn("20 MB", message.replies[-1][0])
+
+    def _audio_job_application(self, service, bot):
+        manager = SimpleNamespace(
+            stages=[],
+            update_stage=lambda job_id, stage: manager.stages.append(stage),
+            set_audio_path=lambda job_id, path: None,
+        )
+        uploads = self.root / "uploads"
+        uploads.mkdir(exist_ok=True)
+        return manager, SimpleNamespace(
+            bot_data={
+                "transcription_service": service,
+                "media_policy": SimpleNamespace(
+                    task_timeout_seconds=10, max_media_bytes=100 * 1024 * 1024
+                ),
+                "job_manager": manager,
+                "paths": SimpleNamespace(uploads_dir=uploads),
+            },
+            bot=bot,
+        )
+
+    async def test_execute_job_downloads_audio_in_worker(self):
+        requests = []
+
+        class FakeService:
+            async def execute_async(self, request, **kwargs):
+                requests.append(request)
+                return TranscriptionResult("transcript", "result")
+
+        async def download_to_drive(custom_path):
+            Path(custom_path).write_bytes(b"audio")
+
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(),
+            get_file=AsyncMock(
+                return_value=SimpleNamespace(
+                    file_size=5, download_to_drive=download_to_drive
+                )
+            ),
+        )
+        manager, application = self._audio_job_application(FakeService(), bot)
+        job = TelegramJob(
+            job_id="job-id",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="audio",
+            telegram_file_id="file-abc",
+            original_filename="meeting.m4a",
+        )
+
+        with patch("telegram_bot._deliver_result", new=AsyncMock()):
+            await _execute_job(application, job, lambda: False)
+
+        bot.get_file.assert_awaited_once_with("file-abc")
+        self.assertIn("downloading", manager.stages)
+        self.assertTrue(requests[0].audio_path.is_file())
+
+    async def test_execute_job_download_failure_is_reported_at_download_stage(self):
+        class FakeService:
+            async def execute_async(self, request, **kwargs):
+                raise AssertionError("must not transcribe")
+
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(),
+            get_file=AsyncMock(side_effect=BadRequest("File is too big")),
+        )
+        _manager, application = self._audio_job_application(FakeService(), bot)
+        job = TelegramJob(
+            job_id="job-id",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="audio",
+            telegram_file_id="file-abc",
+        )
+
+        with self.assertRaises(JobExecutionFailure) as raised:
+            await _execute_job(application, job, lambda: False)
+
+        self.assertEqual(raised.exception.stage, "downloading")
+        self.assertEqual(raised.exception.error_code, "media_too_large")
+        self.assertEqual(list((self.root / "uploads").iterdir()), [])
 
     async def test_execute_job_delivers_before_returning_success(self):
         class FakeService:

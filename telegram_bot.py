@@ -88,6 +88,8 @@ load_dotenv(ROOT_DIR / ".env")
 logger = logging.getLogger(__name__)
 
 PENDING_ACTION_KEY = "pending_action"
+# The hosted Bot API refuses getFile for files above 20 MB.
+TELEGRAM_BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 PENDING_AMBIGUOUS_KEY = "pending_ambiguous"
 MODEL_CHOICES_KEY = "model_choices"
 MAX_TELEGRAM_TEXT = 3800
@@ -639,8 +641,13 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     if message is None or user is None or not await ensure_authorized(update, context):
         return
-    context.user_data.pop(PENDING_ACTION_KEY, None)
-    context.user_data.pop(PENDING_AMBIGUOUS_KEY, None)
+    # An open input session takes priority: /cancel then only exits the input
+    # and never touches a running transcription.
+    pending_action = context.user_data.pop(PENDING_ACTION_KEY, None)
+    pending_choice = context.user_data.pop(PENDING_AMBIGUOUS_KEY, None)
+    if pending_action or pending_choice:
+        await _reply_html(message, "已退出输入。", reply_markup=build_home_keyboard())
+        return
     manager: TelegramJobManager = context.application.bot_data["job_manager"]
     job = _latest_user_job(manager, user.id)
     if job is None:
@@ -805,6 +812,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     data = query.data or ""
+    # Any button press ends a pending text input; branches that start a new
+    # input set it again below. Otherwise a later link could be saved as a
+    # setting value after the user has navigated away.
+    context.user_data.pop(PENDING_ACTION_KEY, None)
     config_store: GlobalConfigStore = context.application.bot_data["config_store"]
     key_pool: GeminiKeyPool = context.application.bot_data["key_pool"]
     manager: TelegramJobManager = context.application.bot_data["job_manager"]
@@ -1003,6 +1014,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if job is None or job.user_id != user.id:
             await query.message.reply_text("任务不存在或无权操作。")
             return
+        # Each retry gets its own status card so the clicked message (a
+        # failed card or the queue panel) is never overwritten.
+        status_message = await _reply_html(
+            query.message, "<b>已接收重试</b>\n正在加入任务队列……"
+        )
         try:
             detected_source = (
                 detect_text_source(job.text_input) if job.text_input else None
@@ -1010,16 +1026,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             retried = manager.retry(
                 job_id,
                 source_type_override=detected_source or job.source_type,
-                status_message_id=(
-                    getattr(query.message, "message_id", 0)
-                    or job.status_message_id
-                ),
+                status_message_id=getattr(status_message, "message_id", 0) or 0,
             )
         except (ValueError, KeyError) as exc:
-            await query.message.reply_text(str(exc))
+            reason = str(exc) if isinstance(exc, ValueError) else "任务不存在。"
+            await _edit_message(status_message, escape(reason), build_home_keyboard())
             return
-        await query.message.reply_text(
-            f"任务已重新排队：{retried.job_id[:8]}，当前第 {manager.queue_position(retried.job_id)} 位。"
+        await _edit_message(
+            status_message,
+            f"<b>任务已重新排队</b>\n任务：{html_code(retried.job_id[:8])}\n"
+            f"当前位置：{manager.queue_position(retried.job_id)}",
+            build_cancel_job_keyboard(retried.job_id),
         )
         return
     if data.startswith("result:full:"):
@@ -1211,6 +1228,17 @@ async def _enqueue_text(
     )
 
 
+async def _edit_message(
+    message: Message,
+    text: str,
+    markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    try:
+        await message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except Exception:
+        logger.debug("Unable to edit a Telegram status message.")
+
+
 async def _enqueue_job(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1219,6 +1247,7 @@ async def _enqueue_job(
     source_type: str,
     text_input: str = "",
     audio_path: str = "",
+    telegram_file_id: str = "",
     original_filename: str = "",
 ) -> TelegramJob:
     status_message = await _reply_html(message, "<b>已接收</b>\n正在加入任务队列……")
@@ -1232,6 +1261,7 @@ async def _enqueue_job(
         source_type=source_type,
         text_input=text_input,
         audio_path=audio_path,
+        telegram_file_id=telegram_file_id,
         original_filename=original_filename,
         source_message_id=getattr(message, "message_id", 0) or 0,
         status_message_id=getattr(status_message, "message_id", 0) or 0,
@@ -1294,23 +1324,21 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if file_size and file_size > policy.max_media_bytes:
         await message.reply_text("音频文件超过服务端大小限制。")
         return
-
-    paths: BotPaths = context.application.bot_data["paths"]
-    original = getattr(source_file, "file_name", "") or "voice.ogg"
-    safe_name = sanitize_upload_name(original, default="voice.ogg")
-    destination = paths.uploads_dir / f"tg_{user.id}_{uuid.uuid4().hex}_{safe_name}"
-    telegram_file = await source_file.get_file()
-    await telegram_file.download_to_drive(custom_path=str(destination))
-    if destination.stat().st_size > policy.max_media_bytes:
-        destination.unlink(missing_ok=True)
-        await message.reply_text("音频文件超过服务端大小限制。")
+    if file_size and file_size > TELEGRAM_BOT_API_DOWNLOAD_LIMIT:
+        await message.reply_text(
+            "音频文件超过 Telegram Bot API 的 20 MB 下载限制，"
+            "请压缩后重发，或改为发送媒体直链。"
+        )
         return
+
+    original = getattr(source_file, "file_name", "") or "voice.ogg"
+    # Download happens in the job worker so this update returns immediately.
     await _enqueue_job(
         message,
         context,
         user_id=user.id,
         source_type="audio",
-        audio_path=str(destination),
+        telegram_file_id=source_file.file_id,
         original_filename=original,
     )
 
@@ -1404,6 +1432,23 @@ async def _execute_job(
         else:
             asyncio.run_coroutine_threadsafe(operation, loop)
 
+    try:
+        if job.source_type == "audio" and (
+            not job.audio_path or not Path(job.audio_path).is_file()
+        ):
+            on_status("downloading")
+            downloaded = await _download_telegram_audio(application, job)
+            if cancelled():
+                downloaded.unlink(missing_ok=True)
+                raise TaskCancelled("任务已取消。")
+            job = manager.set_audio_path(job.job_id, str(downloaded)) or replace(
+                job, audio_path=str(downloaded)
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise JobExecutionFailure("downloading", diagnose_exception(exc)) from exc
+
     request = TranscriptionRequest(
         source_type=job.source_type,
         text_input=job.text_input or None,
@@ -1444,6 +1489,39 @@ async def _execute_job(
             else diagnose_exception(exc)
         )
         raise JobExecutionFailure(stage, diagnosis) from exc
+
+
+async def _download_telegram_audio(
+    application: Application,
+    job: TelegramJob,
+) -> Path:
+    if not job.telegram_file_id:
+        raise FileNotFoundError("原音频已过期，请重新发送文件。")
+    policy: MediaPolicy = application.bot_data["media_policy"]
+    paths: BotPaths = application.bot_data["paths"]
+    safe_name = sanitize_upload_name(job.original_filename, default="voice.ogg")
+    destination = (
+        paths.uploads_dir / f"tg_{job.user_id}_{uuid.uuid4().hex}_{safe_name}"
+    )
+    try:
+        telegram_file = await application.bot.get_file(job.telegram_file_id)
+    except BadRequest as exc:
+        if "too big" in str(exc).lower():
+            raise DownloadLimitExceeded(
+                "文件超过 Telegram Bot API 的下载限制。"
+            ) from exc
+        raise
+    file_size = int(getattr(telegram_file, "file_size", 0) or 0)
+    if file_size and file_size > policy.max_media_bytes:
+        raise DownloadLimitExceeded("音频文件超过服务端大小限制。")
+    try:
+        await telegram_file.download_to_drive(custom_path=str(destination))
+        if destination.stat().st_size > policy.max_media_bytes:
+            raise DownloadLimitExceeded("音频文件超过服务端大小限制。")
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    return destination
 
 
 def _remove_paths(paths) -> None:

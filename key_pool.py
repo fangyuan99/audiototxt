@@ -147,6 +147,20 @@ class GeminiKeyPool:
 
     @classmethod
     def _classify(cls, exc: BaseException) -> str:
+        # Wrappers such as the YouTube path re-raise provider errors with a
+        # generic message, so inspect the whole cause/context chain.
+        current: Optional[BaseException] = exc
+        visited: set[int] = set()
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            kind = cls._classify_single(current)
+            if kind != "deterministic":
+                return kind
+            current = current.__cause__ or current.__context__
+        return "deterministic"
+
+    @classmethod
+    def _classify_single(cls, exc: BaseException) -> str:
         status = cls._status_code(exc)
         message = str(exc).lower()
         if status in {401, 403} or any(
