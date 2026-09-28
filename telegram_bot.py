@@ -72,7 +72,7 @@ from service_config import (
     parse_api_keys,
 )
 from telegram_delivery import ChatSender, ResultStore, StoredResult
-from telegram_jobs import JobStore, TelegramJob, TelegramJobManager
+from telegram_jobs import JobStore, QueueFull, TelegramJob, TelegramJobManager
 from transcription_service import (
     TaskCancelled,
     TaskDeadline,
@@ -1174,7 +1174,7 @@ async def _enqueue_text(
     user_id: int,
     source_type: str,
     text: str,
-) -> TelegramJob:
+) -> Optional[TelegramJob]:
     value = text
     if source_type in {"youtube", "video_url"}:
         value = extract_first_url(text) or text
@@ -1208,23 +1208,33 @@ async def _enqueue_job(
     audio_path: str = "",
     telegram_file_id: str = "",
     original_filename: str = "",
-) -> TelegramJob:
+) -> Optional[TelegramJob]:
     status_message = await _reply_html(message, "<b>已接收</b>\n正在加入任务队列……")
     manager: TelegramJobManager = context.application.bot_data["job_manager"]
     chat_id = getattr(getattr(message, "chat", None), "id", None)
     if chat_id is None:
         chat_id = getattr(message, "chat_id", user_id)
-    job = manager.enqueue(
-        user_id=user_id,
-        chat_id=chat_id,
-        source_type=source_type,
-        text_input=text_input,
-        audio_path=audio_path,
-        telegram_file_id=telegram_file_id,
-        original_filename=original_filename,
-        source_message_id=getattr(message, "message_id", 0) or 0,
-        status_message_id=getattr(status_message, "message_id", 0) or 0,
-    )
+    try:
+        job = manager.enqueue(
+            user_id=user_id,
+            chat_id=chat_id,
+            source_type=source_type,
+            text_input=text_input,
+            audio_path=audio_path,
+            telegram_file_id=telegram_file_id,
+            original_filename=original_filename,
+            source_message_id=getattr(message, "message_id", 0) or 0,
+            status_message_id=getattr(status_message, "message_id", 0) or 0,
+        )
+    except QueueFull as exc:
+        await _edit_message(
+            status_message,
+            f"<b>未加入队列</b>\n{escape(str(exc))}",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📋 查看队列", callback_data="queue")]]
+            ),
+        )
+        return None
     position = manager.queue_position(job.job_id)
     try:
         await status_message.edit_text(
@@ -1274,23 +1284,35 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     if message is None or user is None or not await ensure_authorized(update, context):
         return
-    source_file = message.audio or message.voice or message.document
+    source_file = (
+        message.audio
+        or message.voice
+        or getattr(message, "video", None)
+        or getattr(message, "video_note", None)
+        or message.document
+    )
     if source_file is None:
-        await message.reply_text("未检测到音频文件。")
+        await message.reply_text("未检测到音频或视频文件。")
         return
     policy: MediaPolicy = context.application.bot_data["media_policy"]
     file_size = int(getattr(source_file, "file_size", 0) or 0)
     if file_size and file_size > policy.max_media_bytes:
-        await message.reply_text("音频文件超过服务端大小限制。")
+        await message.reply_text("媒体文件超过服务端大小限制。")
         return
     if file_size and file_size > TELEGRAM_BOT_API_DOWNLOAD_LIMIT:
         await message.reply_text(
-            "音频文件超过 Telegram Bot API 的 20 MB 下载限制，"
+            "文件超过 Telegram Bot API 的 20 MB 下载限制，"
             "请压缩后重发，或改为发送媒体直链。"
         )
         return
 
-    original = getattr(source_file, "file_name", "") or "voice.ogg"
+    if source_file is getattr(message, "video_note", None):
+        default_name = "video_note.mp4"
+    elif source_file is getattr(message, "video", None):
+        default_name = "video.mp4"
+    else:
+        default_name = "voice.ogg"
+    original = getattr(source_file, "file_name", "") or default_name
     # Download happens in the job worker so this update returns immediately.
     await _enqueue_job(
         message,
@@ -1300,6 +1322,22 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
         telegram_file_id=source_file.file_id,
         original_filename=original,
     )
+
+
+UNSUPPORTED_MESSAGE_TEXT = (
+    "暂不支持这种消息。\n"
+    "请发送音频、语音或视频文件（20 MB 以内），"
+    "或者 YouTube / 抖音 / 媒体直链。"
+)
+
+
+async def handle_unsupported_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    if message is None or not await ensure_authorized(update, context):
+        return
+    await message.reply_text(UNSUPPORTED_MESSAGE_TEXT, reply_markup=build_home_keyboard())
 
 
 async def legacy_settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1827,6 +1865,8 @@ def build_application() -> Application:
         JobStore(paths.jobs_file),
         executor,
         max_concurrent_jobs=int(os.getenv("TG_MAX_CONCURRENT_JOBS", "1")),
+        max_active_jobs=int(os.getenv("TG_MAX_ACTIVE_JOBS", "20")),
+        max_active_jobs_per_user=int(os.getenv("TG_MAX_ACTIVE_JOBS_PER_USER", "5")),
         task_timeout_seconds=media_policy.task_timeout_seconds,
         on_update=on_update,
     )
@@ -1872,12 +1912,30 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(
         MessageHandler(
-            private & (filters.AUDIO | filters.VOICE | filters.Document.AUDIO),
+            private
+            & (
+                filters.AUDIO
+                | filters.VOICE
+                | filters.VIDEO
+                | filters.VIDEO_NOTE
+                | filters.Document.AUDIO
+                | filters.Document.VIDEO
+            ),
             handle_audio_message,
         )
     )
     application.add_handler(
         MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_text_message)
+    )
+    # Registered after the media and text handlers, so it only sees the rest.
+    application.add_handler(
+        MessageHandler(
+            private
+            & filters.UpdateType.MESSAGE
+            & ~filters.COMMAND
+            & ~filters.StatusUpdate.ALL,
+            handle_unsupported_message,
+        )
     )
     application.add_handler(
         MessageHandler(filters.ChatType.GROUPS, reject_group_message)

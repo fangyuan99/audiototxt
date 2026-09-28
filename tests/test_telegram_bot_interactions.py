@@ -27,6 +27,7 @@ from telegram_bot import (
     handle_audio_message,
     handle_callback_query,
     handle_text_message,
+    handle_unsupported_message,
     split_telegram_text,
     start_command,
 )
@@ -520,6 +521,56 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
 
         manager.enqueue.assert_not_called()
         self.assertIn("20 MB", message.replies[-1][0])
+
+    async def test_video_message_is_enqueued_as_media(self):
+        manager = SimpleNamespace(
+            enqueue=unittest.mock.Mock(
+                return_value=TelegramJob(
+                    job_id="video-job", sequence=1, user_id=42, chat_id=42,
+                    source_type="audio",
+                )
+            ),
+            queue_position=lambda job_id: 1,
+        )
+        self.bot_data.update(
+            {
+                "allowed_user_ids": {42},
+                "job_manager": manager,
+                "media_policy": SimpleNamespace(max_media_bytes=100 * 1024 * 1024),
+            }
+        )
+        message = FakeMessage()
+        message.audio = message.voice = message.document = None
+        message.video = SimpleNamespace(file_id="vid", file_size=2048, file_name=None)
+
+        await handle_audio_message(make_update(message), FakeContext(self.bot_data))
+
+        kwargs = manager.enqueue.call_args.kwargs
+        self.assertEqual(kwargs["telegram_file_id"], "vid")
+        self.assertEqual(kwargs["original_filename"], "video.mp4")
+
+    async def test_full_queue_is_reported_on_status_card(self):
+        from telegram_jobs import QueueFull
+
+        manager = SimpleNamespace(
+            enqueue=unittest.mock.Mock(side_effect=QueueFull("任务队列已满，请稍后再试。"))
+        )
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        message = FakeMessage("https://www.youtube.com/watch?v=abc")
+
+        await handle_text_message(make_update(message), FakeContext(self.bot_data))
+
+        card = message.replies[0][2]
+        self.assertIn("队列已满", card.text)
+        self.assertIn("未加入队列", card.text)
+
+    async def test_unsupported_message_gets_guidance(self):
+        self.bot_data["allowed_user_ids"] = {42}
+        message = FakeMessage()
+
+        await handle_unsupported_message(make_update(message), FakeContext(self.bot_data))
+
+        self.assertIn("暂不支持", message.replies[0][0])
 
     def _audio_job_application(self, service, bot):
         manager = SimpleNamespace(

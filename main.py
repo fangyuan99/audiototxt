@@ -508,7 +508,12 @@ def transcribe_audio_streaming(
             '.flac': 'audio/flac',
             '.ogg': 'audio/ogg',
             '.aac': 'audio/aac',
-            '.opus': 'audio/opus'
+            '.opus': 'audio/opus',
+            # Gemini transcribes the audio track of video files directly.
+            '.mp4': 'video/mp4',
+            '.mov': 'video/quicktime',
+            '.webm': 'video/webm',
+            '.3gp': 'video/3gpp',
         }
         mime_type = mime_type_map.get(file_ext, 'audio/mp3')  # 默认为 mp3
         

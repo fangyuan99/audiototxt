@@ -16,7 +16,7 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temp_dir.cleanup()
 
-    async def test_fifo_order_and_positions(self):
+    async def test_users_take_turns_and_positions_match_dispatch(self):
         calls = []
 
         async def executor(job, cancelled):
@@ -34,15 +34,58 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
         third = manager.enqueue(user_id=2, chat_id=20, source_type="youtube", text_input="c")
 
         self.assertEqual(manager.queue_position(first.job_id), 1)
-        self.assertEqual(manager.queue_position(second.job_id), 2)
-        self.assertEqual(manager.queue_position(third.job_id), 3)
+        self.assertEqual(manager.queue_position(third.job_id), 2)
+        self.assertEqual(manager.queue_position(second.job_id), 3)
 
         await manager.start()
         await manager.join()
         await manager.stop()
 
-        self.assertEqual(calls, [first.job_id, second.job_id, third.job_id])
+        self.assertEqual(calls, [first.job_id, third.job_id, second.job_id])
         self.assertTrue(all(job.status == "succeeded" for job in manager.snapshot()))
+
+    async def test_single_user_jobs_stay_in_submission_order(self):
+        calls = []
+
+        async def executor(job, cancelled):
+            calls.append(job.text_input)
+            return "ok"
+
+        manager = TelegramJobManager(JobStore(self.root / "jobs.json"), executor)
+        for text in "abc":
+            manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input=text)
+
+        await manager.start()
+        await manager.join()
+        await manager.stop()
+
+        self.assertEqual(calls, ["a", "b", "c"])
+
+    async def test_per_user_and_global_limits_reject_new_jobs(self):
+        from telegram_jobs import QueueFull
+
+        async def executor(job, cancelled):
+            return "ok"
+
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"),
+            executor,
+            max_active_jobs=3,
+            max_active_jobs_per_user=2,
+        )
+        manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="a")
+        manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="b")
+        with self.assertRaisesRegex(QueueFull, "2 个任务"):
+            manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="c")
+
+        manager.enqueue(user_id=2, chat_id=2, source_type="youtube", text_input="d")
+        with self.assertRaisesRegex(QueueFull, "队列已满"):
+            manager.enqueue(user_id=3, chat_id=3, source_type="youtube", text_input="e")
+
+        # Cancelled jobs free their slot.
+        queued = [job for job in manager.snapshot() if job.user_id == 1]
+        manager.cancel(queued[0].job_id)
+        manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="f")
 
     async def test_queued_job_can_be_cancelled(self):
         gate = asyncio.Event()

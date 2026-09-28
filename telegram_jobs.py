@@ -158,6 +158,13 @@ class JobStore:
                         pass
 
 
+ACTIVE_STATUSES = frozenset({"queued", "running", "cancelling"})
+
+
+class QueueFull(ValueError):
+    """Raised when enqueueing would exceed the global or per-user limit."""
+
+
 class TelegramJobManager:
     def __init__(
         self,
@@ -165,6 +172,8 @@ class TelegramJobManager:
         executor: Callable[[TelegramJob, Callable[[], bool]], Awaitable[object]],
         *,
         max_concurrent_jobs: int = 1,
+        max_active_jobs: int = 20,
+        max_active_jobs_per_user: int = 5,
         task_timeout_seconds: float = 1800.0,
         on_update: Optional[
             Callable[[TelegramJob, str, object], Awaitable[None]]
@@ -173,10 +182,16 @@ class TelegramJobManager:
         self.store = store
         self.executor = executor
         self.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
+        self.max_active_jobs = max(1, int(max_active_jobs))
+        self.max_active_jobs_per_user = max(1, int(max_active_jobs_per_user))
         self.task_timeout_seconds = max(0.001, float(task_timeout_seconds))
         self.on_update = on_update
         self._jobs = store.load()
+        # One token per enqueued job; workers pick the actual job fairly.
         self._queue: asyncio.Queue[str] = asyncio.Queue()
+        # user_id -> dispatch counter at their last start, for round-robin.
+        self._last_dispatch: dict[int, int] = {}
+        self._dispatch_counter = 0
         self._workers: list[asyncio.Task] = []
         self._notification_tasks: set[asyncio.Task] = set()
         self._cancel_events: dict[str, asyncio.Event] = {}
@@ -214,6 +229,7 @@ class TelegramJobManager:
     ) -> TelegramJob:
         now = _utc_now()
         with self._lock:
+            self._check_capacity_locked(int(user_id))
             job = TelegramJob(
                 job_id=uuid.uuid4().hex,
                 sequence=self._next_sequence(),
@@ -234,6 +250,50 @@ class TelegramJobManager:
             self.store.save(self._jobs)
             self._queue.put_nowait(job.job_id)
             return replace(job)
+
+    def _check_capacity_locked(self, user_id: int) -> None:
+        active = [job for job in self._jobs.values() if job.status in ACTIVE_STATUSES]
+        if sum(1 for job in active if job.user_id == user_id) >= self.max_active_jobs_per_user:
+            raise QueueFull(
+                f"你已有 {self.max_active_jobs_per_user} 个任务在排队或执行，"
+                "请等待完成或取消部分任务后再提交。"
+            )
+        if len(active) >= self.max_active_jobs:
+            raise QueueFull("任务队列已满，请稍后再试。")
+
+    def _dispatch_order_locked(self) -> list[TelegramJob]:
+        """Queued jobs in the order workers will start them.
+
+        Users take turns: the user who started a job least recently goes
+        first, and each user's own jobs stay in submission order.
+        """
+        per_user: dict[int, list[TelegramJob]] = {}
+        for job in sorted(self._jobs.values(), key=lambda item: item.sequence):
+            if job.status == "queued":
+                per_user.setdefault(job.user_id, []).append(job)
+        last = dict(self._last_dispatch)
+        counter = self._dispatch_counter
+        order: list[TelegramJob] = []
+        while per_user:
+            user_id = min(
+                per_user,
+                key=lambda uid: (last.get(uid, -1), per_user[uid][0].sequence),
+            )
+            order.append(per_user[user_id].pop(0))
+            if not per_user[user_id]:
+                del per_user[user_id]
+            counter += 1
+            last[user_id] = counter
+        return order
+
+    def _claim_next_locked(self) -> Optional[TelegramJob]:
+        order = self._dispatch_order_locked()
+        if not order:
+            return None
+        job = order[0]
+        self._dispatch_counter += 1
+        self._last_dispatch[job.user_id] = self._dispatch_counter
+        return job
 
     def get(self, job_id: str) -> Optional[TelegramJob]:
         with self._lock:
@@ -299,7 +359,8 @@ class TelegramJobManager:
             return len(expired)
 
     def queue_position(self, job_id: str) -> Optional[int]:
-        queued = [job for job in self.snapshot() if job.status == "queued"]
+        with self._lock:
+            queued = self._dispatch_order_locked()
         for index, job in enumerate(queued, start=1):
             if job.job_id == job_id:
                 return index
@@ -498,27 +559,28 @@ class TelegramJobManager:
 
     async def _worker(self, worker_index: int) -> None:
         while True:
-            job_id = await self._queue.get()
+            await self._queue.get()
+            job_id = ""
             try:
-                job = self.get(job_id)
-                if job is None or job.status != "queued":
-                    continue
-                cancel_event = self._cancel_events.setdefault(job_id, asyncio.Event())
-                if cancel_event.is_set():
-                    terminal = self._set_status(
-                        job_id, "cancelled", error_code="cancelled"
+                with self._lock:
+                    claimed = self._claim_next_locked()
+                    if claimed is None:
+                        # Its job was cancelled while queued.
+                        continue
+                    job_id = claimed.job_id
+                    cancel_event = self._cancel_events.setdefault(
+                        job_id, asyncio.Event()
                     )
-                    await self._notify(terminal, "cancelled")
-                    continue
-
-                running = self._set_status(
-                    job_id,
-                    "running",
-                    stage="preparing",
-                    attempts=job.attempts + 1,
-                    error_code="",
-                    error_message="",
-                )
+                    # Claim and mark running under one lock so no other
+                    # worker can start the same job.
+                    running = self._set_status(
+                        job_id,
+                        "running",
+                        stage="preparing",
+                        attempts=claimed.attempts + 1,
+                        error_code="",
+                        error_message="",
+                    )
                 await self._notify(running, "running")
                 try:
                     result = await asyncio.wait_for(
@@ -577,5 +639,6 @@ class TelegramJobManager:
                         )
                         await self._notify(terminal, "succeeded", result)
             finally:
-                self._cancel_events.pop(job_id, None)
+                if job_id:
+                    self._cancel_events.pop(job_id, None)
                 self._queue.task_done()
