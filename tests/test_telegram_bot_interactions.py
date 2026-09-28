@@ -968,6 +968,31 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         # nothing, and nothing edits the card after the job returns.
         self.assertLessEqual(bot.edit_message_text.await_count, 1)
 
+    async def test_execute_job_redraws_card_while_provider_is_silent(self):
+        class FakeService:
+            async def execute_async(self, request, *, on_status, **kwargs):
+                on_status("transcribing")
+                await asyncio.sleep(0.35)
+                return TranscriptionResult("transcript", "result")
+
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
+        _manager, application = self._audio_job_application(FakeService(), bot)
+        application.bot_data["progress_interval_seconds"] = 0.1
+        job = TelegramJob(
+            job_id="job-id", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", text_input="https://youtu.be/x",
+            status_message_id=5, settings_snapshot={"model_name": "m-1"},
+        )
+
+        await _execute_job(application, job, lambda: False)
+        edits_at_return = bot.edit_message_text.await_count
+        await asyncio.sleep(0.25)
+
+        # No progress events arrive, yet the timer keeps redrawing the card,
+        # and it stops once the job returns.
+        self.assertGreaterEqual(edits_at_return, 3)
+        self.assertEqual(bot.edit_message_text.await_count, edits_at_return)
+
     def test_progress_card_shows_real_counters_only(self):
         job = TelegramJob(
             job_id="abcdef123456", sequence=1, user_id=1, chat_id=1,

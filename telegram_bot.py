@@ -1772,13 +1772,36 @@ async def _execute_job(
             progress["last_edit"] = now
         schedule_refresh()
 
+    async def tick() -> None:
+        # Stages such as waiting for Gemini's first token emit no events, so
+        # redraw on a timer too; this keeps the elapsed time moving.
+        tick_interval = max(interval, 0.05)
+        while True:
+            with stage_lock:
+                if progress["closed"]:
+                    return
+                last = max(progress["last_edit"], started)
+                wait = last + tick_interval - time.monotonic()
+                if wait <= 0:
+                    progress["last_edit"] = time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            await refresh_card()
+
+    ticker: dict[str, Optional[asyncio.Task]] = {"task": None}
+
     def close_card() -> None:
         with stage_lock:
             progress["closed"] = True
+        if ticker["task"] is not None:
+            ticker["task"].cancel()
 
     reused = _reuse_stored_result(application, job)
     if reused is not None:
         return reused
+
+    ticker["task"] = loop.create_task(tick())
 
     try:
         if job.source_type == "audio" and (
@@ -1798,8 +1821,10 @@ async def _execute_job(
                 job, audio_path=str(downloaded)
             )
     except (asyncio.CancelledError, TaskCancelled):
+        close_card()
         raise
     except Exception as exc:
+        close_card()
         raise JobExecutionFailure("downloading", diagnose_exception(exc)) from exc
 
     request = TranscriptionRequest(
