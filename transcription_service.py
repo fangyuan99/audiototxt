@@ -70,6 +70,9 @@ class TranscriptionResult:
         return self.finish_reason not in COMPLETE_FINISH_REASONS
 
 
+PROGRESS_TAIL_CHARS = 200
+
+
 class _ProviderCall:
     """Per-request hooks shared by every key-pool attempt."""
 
@@ -77,11 +80,19 @@ class _ProviderCall:
         self,
         cancelled: Optional[Callable[[], bool]],
         deadline: "TaskDeadline",
+        on_progress: Optional[Callable[[int, str], None]] = None,
     ) -> None:
         self.cancelled = cancelled
         self.deadline = deadline
+        self.on_progress = on_progress
         self.finish_reason = ""
         self.characters = 0
+        self.tail = ""
+
+    def begin_attempt(self) -> None:
+        # A key failover restarts the stream, so progress starts over.
+        self.characters = 0
+        self.tail = ""
 
     def should_abort(self) -> bool:
         return bool(
@@ -95,6 +106,9 @@ class _ProviderCall:
             raise TaskCancelled("任务已取消。")
         self.deadline.check()
         self.characters += len(delta)
+        self.tail = (self.tail + delta)[-PROGRESS_TAIL_CHARS:]
+        if self.on_progress is not None:
+            self.on_progress(self.characters, self.tail)
 
     def on_finish(self, reason: str) -> None:
         self.finish_reason = reason or ""
@@ -256,6 +270,8 @@ class TranscriptionService:
         deadline: TaskDeadline,
         call: _ProviderCall,
     ) -> dict:
+        # Built once per provider attempt.
+        call.begin_attempt()
         return {
             "model_name": settings.model_name,
             "language_hint": settings.language_hint or None,
@@ -345,7 +361,10 @@ class TranscriptionService:
         on_status: Optional[Callable[[str], None]] = None,
         cancelled: Optional[Callable[[], bool]] = None,
         deadline: Optional[TaskDeadline] = None,
+        on_progress: Optional[Callable[[int, str], None]] = None,
     ) -> TranscriptionResult:
+        """Run one request. ``on_progress(characters, tail)`` fires on every
+        streamed chunk from the worker thread; callers must throttle."""
         active_deadline = deadline or TaskDeadline(
             self.media_policy.task_timeout_seconds
         )
@@ -361,7 +380,7 @@ class TranscriptionService:
             if not request.text_input:
                 raise ValueError("缺少 YouTube 链接。")
             emit("transcribing")
-            call = _ProviderCall(cancelled, active_deadline)
+            call = _ProviderCall(cancelled, active_deadline, on_progress)
             try:
                 transcript = self._require_transcript(
                     self._transcribe_youtube(
@@ -456,7 +475,7 @@ class TranscriptionService:
 
         self._check(cancelled, active_deadline)
         emit("transcribing")
-        call = _ProviderCall(cancelled, active_deadline)
+        call = _ProviderCall(cancelled, active_deadline, on_progress)
         try:
             transcript = self._require_transcript(
                 self._transcribe_audio(audio_path, settings, active_deadline, call)

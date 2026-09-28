@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import replace
@@ -1444,6 +1445,40 @@ _STATUS_LABELS = {
 }
 
 
+PROGRESS_EDIT_INTERVAL_SECONDS = 5.0
+PROGRESS_PREVIEW_CHARS = 120
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    return f"{minutes}分{secs:02d}秒" if minutes else f"{secs}秒"
+
+
+def render_job_progress(
+    job: TelegramJob,
+    stage: str,
+    *,
+    elapsed_seconds: float,
+    characters: int = 0,
+    tail: str = "",
+) -> str:
+    """Status card for a running job. Shows real counters only, never an
+    estimated percentage."""
+    label = _STATUS_LABELS.get(stage, stage)
+    lines = [
+        f"<b>{escape(label)}</b>",
+        f"任务：{html_code(job.job_id[:8])}{_snapshot_model_line(job.settings_snapshot)}",
+        f"已用时：{_format_elapsed(elapsed_seconds)}",
+    ]
+    if characters:
+        lines.append(f"已生成：{characters} 字")
+    preview = " ".join(tail.split())[-PROGRESS_PREVIEW_CHARS:]
+    if preview:
+        lines.append(f"<blockquote>…{escape(preview)}</blockquote>")
+    return "\n".join(lines)
+
+
 async def _execute_job(
     application: Application,
     job: TelegramJob,
@@ -1455,26 +1490,66 @@ async def _execute_job(
     loop = asyncio.get_running_loop()
     current_stage = {"value": "preparing"}
     stage_lock = threading.Lock()
-
-    def on_status(status: str) -> None:
-        with stage_lock:
-            current_stage["value"] = status
-        manager.update_stage(job.job_id, status)
-        label = _STATUS_LABELS.get(status, status)
-        operation = _safe_edit_status(
-            application,
-            job,
-            f"<b>{escape(label)}</b>\n任务：{html_code(job.job_id[:8])}",
-            build_cancel_job_keyboard(job.job_id),
+    interval = float(
+        application.bot_data.get(
+            "progress_interval_seconds", PROGRESS_EDIT_INTERVAL_SECONDS
         )
+    )
+    started = time.monotonic()
+    progress = {"characters": 0, "tail": "", "last_edit": float("-inf"), "closed": False}
+    card_lock = asyncio.Lock()
+
+    async def refresh_card() -> None:
+        # Edits run one at a time and render the latest state, so a slow
+        # edit never overwrites a newer one; none run after the job ends.
+        async with card_lock:
+            with stage_lock:
+                if progress["closed"]:
+                    return
+                text = render_job_progress(
+                    job,
+                    current_stage["value"],
+                    elapsed_seconds=time.monotonic() - started,
+                    characters=progress["characters"],
+                    tail=progress["tail"],
+                )
+            await _safe_edit_status(
+                application, job, text, build_cancel_job_keyboard(job.job_id)
+            )
+
+    def schedule_refresh() -> None:
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
         if running_loop is loop:
-            loop.create_task(operation)
+            loop.create_task(refresh_card())
         else:
-            asyncio.run_coroutine_threadsafe(operation, loop)
+            asyncio.run_coroutine_threadsafe(refresh_card(), loop)
+
+    def on_status(status: str) -> None:
+        with stage_lock:
+            current_stage["value"] = status
+            if status != "transcribing":
+                progress["characters"] = 0
+                progress["tail"] = ""
+            progress["last_edit"] = time.monotonic()
+        manager.update_stage(job.job_id, status)
+        schedule_refresh()
+
+    def on_progress(characters: int, tail: str) -> None:
+        now = time.monotonic()
+        with stage_lock:
+            progress["characters"] = characters
+            progress["tail"] = tail
+            if now - progress["last_edit"] < interval:
+                return
+            progress["last_edit"] = now
+        schedule_refresh()
+
+    def close_card() -> None:
+        with stage_lock:
+            progress["closed"] = True
 
     try:
         if job.source_type == "audio" and (
@@ -1507,6 +1582,7 @@ async def _execute_job(
             result = await async_execute(
                 request,
                 on_status=on_status,
+                on_progress=on_progress,
                 cancelled=cancelled,
                 deadline=TaskDeadline(timeout),
             )
@@ -1515,9 +1591,11 @@ async def _execute_job(
                 service.execute,
                 request,
                 on_status=on_status,
+                on_progress=on_progress,
                 cancelled=cancelled,
                 deadline=TaskDeadline(timeout),
             )
+        close_card()
         if cancelled():
             raise TaskCancelled("任务已取消。")
         store: ResultStore = application.bot_data["result_store"]
@@ -1537,8 +1615,10 @@ async def _execute_job(
         _remove_paths(result.cleanup_paths)
         return result
     except asyncio.CancelledError:
+        close_card()
         raise
     except Exception as exc:
+        close_card()
         with stage_lock:
             stage = current_stage["value"]
         diagnosis = (
@@ -1680,6 +1760,7 @@ async def _deliver_job(application: Application, job_id: str) -> None:
             manager.update_delivery(job_id, delivery_status="delivered")
     except asyncio.CancelledError:
         # Left as "sending" so the next start resumes from the last chunk.
+        manager.flush()
         raise
     except Exception as exc:
         logger.warning(

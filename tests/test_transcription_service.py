@@ -151,6 +151,32 @@ class TranscriptionServiceTest(unittest.TestCase):
                 1,
             )
 
+    def test_progress_counts_restart_after_key_failover(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            service, functions = self.make_service(root)
+            progress = []
+
+            def transcribe_youtube(**kwargs):
+                kwargs["on_chunk"]("abc")
+                if kwargs["api_key"] == "key-a":
+                    error = RuntimeError("quota exhausted")
+                    error.status_code = 429
+                    raise error
+                kwargs["on_chunk"]("de")
+                return "abcde"
+
+            functions.transcribe_youtube = transcribe_youtube
+            service.execute(
+                TranscriptionRequest(
+                    source_type="youtube",
+                    text_input="https://www.youtube.com/watch?v=abc",
+                ),
+                on_progress=lambda count, tail: progress.append((count, tail)),
+            )
+
+            self.assertEqual(progress, [(3, "abc"), (3, "abc"), (5, "abcde")])
+
     def test_transient_download_failure_retries_once(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

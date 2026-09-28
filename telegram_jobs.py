@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
@@ -178,6 +179,8 @@ class TelegramJobManager:
         max_active_jobs: int = 20,
         max_active_jobs_per_user: int = 5,
         task_timeout_seconds: float = 1800.0,
+        save_interval_seconds: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
         on_update: Optional[
             Callable[[TelegramJob, str, object], Awaitable[None]]
         ] = None,
@@ -189,6 +192,12 @@ class TelegramJobManager:
         self.max_active_jobs_per_user = max(1, int(max_active_jobs_per_user))
         self.task_timeout_seconds = max(0.001, float(task_timeout_seconds))
         self.on_update = on_update
+        # Stage and chunk-progress changes are coalesced into at most one
+        # write per interval; status transitions are always written at once.
+        self.save_interval_seconds = max(0.0, float(save_interval_seconds))
+        self._clock = clock
+        self._last_save = float("-inf")
+        self._dirty = False
         self._jobs = store.load()
         # One token per enqueued job; workers pick the actual job fairly.
         self._queue: asyncio.Queue[str] = asyncio.Queue()
@@ -211,7 +220,7 @@ class TelegramJobManager:
                 job.updated_at = _utc_now()
                 changed = True
         if changed:
-            self.store.save(self._jobs)
+            self._persist_locked()
 
     def _next_sequence(self) -> int:
         return max((job.sequence for job in self._jobs.values()), default=0) + 1
@@ -252,7 +261,7 @@ class TelegramJobManager:
                 updated_at=now,
             )
             self._jobs[job.job_id] = job
-            self.store.save(self._jobs)
+            self._persist_locked()
             self._queue.put_nowait(job.job_id)
             return replace(job)
 
@@ -326,7 +335,7 @@ class TelegramJobManager:
                 return
             job.restart_notified = True
             job.updated_at = _utc_now()
-            self.store.save(self._jobs)
+            self._persist_locked()
 
     def prune_terminal(
         self,
@@ -360,7 +369,7 @@ class TelegramJobManager:
                 self._jobs.pop(job_id, None)
                 self._cancel_events.pop(job_id, None)
             if expired:
-                self.store.save(self._jobs)
+                self._persist_locked()
             return len(expired)
 
     def queue_position(self, job_id: str) -> Optional[int]:
@@ -379,8 +388,23 @@ class TelegramJobManager:
             for key, value in changes.items():
                 if hasattr(job, key):
                     setattr(job, key, value)
-            self.store.save(self._jobs)
+            self._persist_locked()
             return replace(job)
+
+    def _persist_locked(self, *, critical: bool = True) -> None:
+        now = self._clock()
+        if critical or now - self._last_save >= self.save_interval_seconds:
+            self.store.save(self._jobs)
+            self._last_save = now
+            self._dirty = False
+        else:
+            self._dirty = True
+
+    def flush(self) -> None:
+        """Write any coalesced changes that have not reached disk yet."""
+        with self._lock:
+            if self._dirty:
+                self._persist_locked()
 
     def set_audio_path(self, job_id: str, audio_path: str) -> Optional[TelegramJob]:
         with self._lock:
@@ -389,7 +413,7 @@ class TelegramJobManager:
                 return None
             job.audio_path = audio_path or ""
             job.updated_at = _utc_now()
-            self.store.save(self._jobs)
+            self._persist_locked()
             return replace(job)
 
     def update_delivery(self, job_id: str, **changes) -> Optional[TelegramJob]:
@@ -398,11 +422,13 @@ class TelegramJobManager:
             job = self._jobs.get(job_id)
             if job is None:
                 return None
-            for key, value in changes.items():
-                if key in allowed:
-                    setattr(job, key, value)
+            applied = {key for key in changes if key in allowed}
+            for key in applied:
+                setattr(job, key, changes[key])
             job.updated_at = _utc_now()
-            self.store.save(self._jobs)
+            # Per-chunk progress alone is not critical: losing it on a crash
+            # only means a resend may repeat a chunk or two.
+            self._persist_locked(critical=applied != {"delivered_chunks"})
             return replace(job)
 
     def undelivered_jobs(self) -> list[TelegramJob]:
@@ -436,7 +462,7 @@ class TelegramJobManager:
                 return replace(job)
             job.stage = normalized
             job.updated_at = _utc_now()
-            self.store.save(self._jobs)
+            self._persist_locked(critical=False)
             return replace(job)
 
     async def _notify(self, job: TelegramJob, event: str, payload=None) -> None:
@@ -560,8 +586,8 @@ class TelegramJobManager:
                     job.restart_notified = False
                     job.updated_at = _utc_now()
                     changed = True
-            if changed:
-                self.store.save(self._jobs)
+            if changed or self._dirty:
+                self._persist_locked()
         if self._notification_tasks:
             await asyncio.gather(
                 *list(self._notification_tasks), return_exceptions=True

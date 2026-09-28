@@ -14,6 +14,7 @@ from channel_health import ChannelHealthResult
 from key_pool import GeminiKeyPool
 from service_config import GlobalConfigStore
 from telegram_bot import (
+    render_job_progress,
     _settings_changed,
     build_failed_job_keyboard,
     JobExecutionFailure,
@@ -686,6 +687,48 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         bot.get_file.assert_awaited_once_with("file-abc")
         self.assertIn("downloading", manager.stages)
         self.assertTrue(requests[0].audio_path.is_file())
+
+    async def test_execute_job_throttles_progress_edits(self):
+        class FakeService:
+            async def execute_async(self, request, *, on_status, on_progress, **kwargs):
+                on_status("transcribing")
+                for count in range(1, 51):
+                    on_progress(count, "<b>" + "字" * count)
+                return TranscriptionResult("transcript", "result")
+
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
+        _manager, application = self._audio_job_application(FakeService(), bot)
+        application.bot_data["progress_interval_seconds"] = 3600
+        job = TelegramJob(
+            job_id="job-id", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", text_input="https://youtu.be/x",
+            status_message_id=5, settings_snapshot={"model_name": "m-1"},
+        )
+
+        await _execute_job(application, job, lambda: False)
+        await asyncio.sleep(0)
+
+        # The stage change edits at once; 50 chunks inside the interval add
+        # nothing, and nothing edits the card after the job returns.
+        self.assertLessEqual(bot.edit_message_text.await_count, 1)
+
+    def test_progress_card_shows_real_counters_only(self):
+        job = TelegramJob(
+            job_id="abcdef123456", sequence=1, user_id=1, chat_id=1,
+            source_type="youtube", settings_snapshot={"model_name": "m-1"},
+        )
+        text = render_job_progress(
+            job, "transcribing", elapsed_seconds=65, characters=1234,
+            tail="x" * 300 + "\nline <script>",
+        )
+        self.assertIn("正在转写", text)
+        self.assertIn("m-1", text)
+        self.assertIn("1分05秒", text)
+        self.assertIn("1234 字", text)
+        self.assertIn("line &lt;script&gt;", text)
+        self.assertNotIn("%", text)
+        preview = text.split("<blockquote>")[1]
+        self.assertLessEqual(len(preview), 160)
 
     async def test_execute_job_download_failure_is_reported_at_download_stage(self):
         class FakeService:

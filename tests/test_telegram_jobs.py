@@ -74,6 +74,37 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloaded[job.job_id].settings_snapshot, {"model_name": "old-model"})
         self.assertNotIn("gemini_api_keys", str(reloaded[job.job_id].to_dict()))
 
+    async def test_stage_and_chunk_updates_are_coalesced(self):
+        now = {"value": 0.0}
+        path = self.root / "jobs.json"
+        manager = TelegramJobManager(
+            JobStore(path),
+            lambda job, cancelled: None,
+            save_interval_seconds=10,
+            clock=lambda: now["value"],
+        )
+        job = manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="a")
+
+        def on_disk():
+            return JobStore(path).load()[job.job_id]
+
+        manager.update_stage(job.job_id, "transcribing")
+        self.assertEqual(on_disk().stage, "queued")
+        now["value"] = 11
+        manager.update_stage(job.job_id, "retrying")
+        self.assertEqual(on_disk().stage, "retrying")
+
+        manager._set_status(job.job_id, "succeeded")
+        manager.update_delivery(job.job_id, delivered_chunks=3)
+        self.assertEqual(on_disk().delivered_chunks, 0)
+        manager.flush()
+        self.assertEqual(on_disk().delivered_chunks, 3)
+
+        manager.update_delivery(job.job_id, delivered_chunks=4)
+        manager.update_delivery(job.job_id, delivery_status="delivered")
+        self.assertEqual(on_disk().delivered_chunks, 4)
+        self.assertEqual(on_disk().delivery_status, "delivered")
+
     async def test_single_user_jobs_stay_in_submission_order(self):
         calls = []
 
