@@ -129,6 +129,9 @@ def diagnose_exception(exc: BaseException) -> ErrorDiagnosis:
     elif "unsafeurl" in class_names or "非公网地址" in normalized:
         code = "unsafe_url"
         message = "链接不是安全的公网地址。"
+    elif "inlineaudiotoolarge" in class_names:
+        code = "media_too_large"
+        message = "音频超过 Vertex AI 单次请求上限，请压缩音频或改用 Gemini API Key 渠道。"
     elif "downloadlimit" in class_names or "超过限制" in normalized:
         code = "media_too_large"
         message = "媒体文件超过服务端大小限制。"
