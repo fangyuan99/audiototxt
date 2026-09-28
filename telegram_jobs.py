@@ -74,6 +74,11 @@ class TelegramJob:
     error_message: str = ""
     attempts: int = 0
     retry_of: str = ""
+    # Delivery runs after the job succeeds: "", pending, sending, delivered
+    # or failed. delivered_chunks lets a resend resume where it stopped.
+    delivery_status: str = ""
+    delivered_chunks: int = 0
+    document_sent: bool = False
     restart_notified: bool = False
     created_at: str = ""
     updated_at: str = ""
@@ -320,6 +325,27 @@ class TelegramJobManager:
             job.updated_at = _utc_now()
             self.store.save(self._jobs)
             return replace(job)
+
+    def update_delivery(self, job_id: str, **changes) -> Optional[TelegramJob]:
+        allowed = {"delivery_status", "delivered_chunks", "document_sent"}
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            for key, value in changes.items():
+                if key in allowed:
+                    setattr(job, key, value)
+            job.updated_at = _utc_now()
+            self.store.save(self._jobs)
+            return replace(job)
+
+    def undelivered_jobs(self) -> list[TelegramJob]:
+        return [
+            job
+            for job in self.snapshot()
+            if job.status == "succeeded"
+            and job.delivery_status in {"pending", "sending"}
+        ]
 
     def active_retry_of(self, job_id: str) -> Optional[TelegramJob]:
         with self._lock:

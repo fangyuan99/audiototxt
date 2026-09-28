@@ -3,10 +3,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 from bot_state import BotStateStore
 from channel_health import ChannelHealthResult
@@ -16,18 +17,20 @@ from telegram_bot import (
     JobExecutionFailure,
     MODEL_CHOICES_KEY,
     PENDING_ACTION_KEY,
-    ResultCache,
-    _deliver_result,
+    _deliver_job,
     _execute_job,
     _handle_setting_input,
     _on_job_update,
+    _resume_undelivered,
     build_application,
     cancel_command,
     handle_audio_message,
     handle_callback_query,
     handle_text_message,
+    split_telegram_text,
     start_command,
 )
+from telegram_delivery import ChatSender, ResultStore
 from telegram_jobs import TelegramJob
 from transcription_service import TranscriptionResult
 
@@ -523,6 +526,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
             stages=[],
             update_stage=lambda job_id, stage: manager.stages.append(stage),
             set_audio_path=lambda job_id, path: None,
+            update_delivery=lambda job_id, **changes: None,
         )
         uploads = self.root / "uploads"
         uploads.mkdir(exist_ok=True)
@@ -534,6 +538,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 "job_manager": manager,
                 "paths": SimpleNamespace(uploads_dir=uploads),
+                "result_store": ResultStore(self.root / "results"),
             },
             bot=bot,
         )
@@ -568,8 +573,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
             original_filename="meeting.m4a",
         )
 
-        with patch("telegram_bot._deliver_result", new=AsyncMock()):
-            await _execute_job(application, job, lambda: False)
+        await _execute_job(application, job, lambda: False)
 
         bot.get_file.assert_awaited_once_with("file-abc")
         self.assertIn("downloading", manager.stages)
@@ -601,135 +605,217 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.error_code, "media_too_large")
         self.assertEqual(list((self.root / "uploads").iterdir()), [])
 
-    async def test_execute_job_delivers_before_returning_success(self):
+    async def test_execute_job_persists_result_and_leaves_delivery_to_worker(self):
         class FakeService:
-            def execute(self, request, **kwargs):
-                kwargs["on_status"]("transcribing")
-                return TranscriptionResult("transcript", "result")
-
             async def execute_async(self, request, **kwargs):
-                return self.execute(request, **kwargs)
+                kwargs["on_status"]("transcribing")
+                return TranscriptionResult(
+                    "transcript", "result", finish_reason="MAX_TOKENS"
+                )
 
         class FakeManager:
             def __init__(self):
                 self.stages = []
+                self.delivery = {}
 
             def update_stage(self, job_id, stage):
                 self.stages.append(stage)
 
-            def get(self, job_id):
-                return SimpleNamespace(stage=self.stages[-1] if self.stages else "preparing")
+            def update_delivery(self, job_id, **changes):
+                self.delivery.update(changes)
 
         manager = FakeManager()
+        store = ResultStore(self.root / "results")
+        bot = SimpleNamespace(edit_message_text=AsyncMock(), send_message=AsyncMock())
         application = SimpleNamespace(
             bot_data={
                 "transcription_service": FakeService(),
                 "media_policy": SimpleNamespace(task_timeout_seconds=10),
                 "job_manager": manager,
+                "result_store": store,
             },
-            bot=SimpleNamespace(edit_message_text=AsyncMock()),
+            bot=bot,
         )
         job = TelegramJob(
-            job_id="job-id",
-            sequence=1,
-            user_id=42,
-            chat_id=42,
-            source_type="youtube",
+            job_id="job-id", sequence=1, user_id=42, chat_id=42, source_type="youtube"
         )
 
-        with patch("telegram_bot._deliver_result", new=AsyncMock()) as deliver:
-            result = await _execute_job(application, job, lambda: False)
+        result = await _execute_job(application, job, lambda: False)
 
         self.assertEqual(result.transcript, "transcript")
-        deliver.assert_awaited_once()
-        self.assertIn("transcribing", manager.stages)
-        self.assertEqual(manager.stages[-1], "delivering")
+        stored = store.load("job-id")
+        self.assertEqual(stored.transcript, "transcript")
+        self.assertTrue(stored.incomplete)
+        self.assertEqual(manager.delivery["delivery_status"], "pending")
+        self.assertNotIn("delivering", manager.stages)
+        bot.send_message.assert_not_awaited()
 
-    async def test_delivery_failure_is_wrapped_with_safe_stage(self):
-        class FakeService:
-            def execute(self, request, **kwargs):
-                return TranscriptionResult("transcript", "result")
-
-            async def execute_async(self, request, **kwargs):
-                return self.execute(request, **kwargs)
-
-        class FakeManager:
-            def __init__(self):
-                self.stage = "preparing"
-
-            def update_stage(self, job_id, stage):
-                self.stage = stage
+    def _delivery_application(self, job, transcript, bot, finish_reason=""):
+        class FakeDeliveryManager:
+            def __init__(self, job):
+                self.job = job
 
             def get(self, job_id):
-                return SimpleNamespace(stage=self.stage)
+                return replace(self.job) if job_id == self.job.job_id else None
 
-        application = SimpleNamespace(
-            bot_data={
-                "transcription_service": FakeService(),
-                "media_policy": SimpleNamespace(task_timeout_seconds=10),
-                "job_manager": FakeManager(),
-            },
-            bot=SimpleNamespace(edit_message_text=AsyncMock()),
+            def update_delivery(self, job_id, **changes):
+                for key, value in changes.items():
+                    setattr(self.job, key, value)
+                return replace(self.job)
+
+            def undelivered_jobs(self):
+                if self.job.delivery_status in {"pending", "sending"}:
+                    return [replace(self.job)]
+                return []
+
+        store = ResultStore(self.root / "results")
+        store.save(
+            job.job_id, transcript, filename_stem="talk", finish_reason=finish_reason
         )
-        job = TelegramJob(
-            job_id="job-id",
-            sequence=1,
-            user_id=42,
-            chat_id=42,
-            source_type="youtube",
-        )
-
-        with patch(
-            "telegram_bot._deliver_result",
-            new=AsyncMock(
-                side_effect=RuntimeError(
-                    "send failed https://example/get?token=secret"
-                )
-            ),
-        ):
-            with self.assertRaises(JobExecutionFailure) as raised:
-                await _execute_job(application, job, lambda: False)
-
-        self.assertEqual(raised.exception.stage, "delivering")
-        self.assertNotIn("token=secret", str(raised.exception))
-
-    async def test_long_result_is_sent_in_full_across_multiple_messages(self):
-        transcript = "第一段。" * 1000 + "\n\n" + "🙂" * 1500
-        bot = SimpleNamespace(
-            send_message=AsyncMock(),
-            send_document=AsyncMock(),
-            edit_message_text=AsyncMock(),
-        )
-        cache = ResultCache()
+        manager = FakeDeliveryManager(job)
         application = SimpleNamespace(
             bot=bot,
             bot_data={
-                "result_cache": cache,
-                "paths": SimpleNamespace(outputs_dir=self.root),
+                "job_manager": manager,
+                "result_store": store,
+                "chat_sender": ChatSender(min_interval_seconds=0, sleep=AsyncMock()),
+                "allowed_user_ids": {42},
+                **{key: value for key, value in self.bot_data.items() if key != "allowed_user_ids"},
             },
         )
+        return manager, application
+
+    @staticmethod
+    def _recording_bot(fail_at=()):
+        sent = []
+        attempts = {"count": 0}
+
+        async def send_message(chat_id, text, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] in fail_at:
+                raise BadRequest("Chat not found")
+            sent.append(text)
+
+        bot = SimpleNamespace(
+            send_message=send_message,
+            send_document=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        return bot, sent
+
+    async def test_long_result_is_sent_in_full_across_multiple_messages(self):
+        transcript = "第一段。" * 1000 + "\n\n" + "🙂" * 1500
+        bot, sent = self._recording_bot()
         job = TelegramJob(
-            job_id="long-result",
-            sequence=1,
-            user_id=42,
-            chat_id=42,
-            source_type="youtube",
+            job_id="long-result", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded", status_message_id=7,
         )
+        manager, application = self._delivery_application(job, transcript, bot)
 
-        await _deliver_result(
-            application,
-            job,
-            TranscriptionResult(transcript, "long-transcript"),
-        )
+        await _deliver_job(application, job.job_id)
 
-        sent_chunks = [
-            call.kwargs["text"] for call in bot.send_message.await_args_list
-        ]
-        self.assertGreater(len(sent_chunks), 1)
-        self.assertEqual("".join(sent_chunks), transcript)
-        self.assertNotIn("完整内容见", "".join(sent_chunks))
-        self.assertEqual(cache.get(job.job_id), transcript)
+        self.assertGreater(len(sent), 1)
+        self.assertEqual("".join(sent), transcript)
         bot.send_document.assert_awaited_once()
+        self.assertEqual(manager.job.delivery_status, "delivered")
+        final_markup = bot.edit_message_text.await_args.kwargs["reply_markup"]
+        callbacks = [b.callback_data for row in final_markup.inline_keyboard for b in row]
+        self.assertIn("result:full:long-result", callbacks)
+
+    async def test_failed_delivery_offers_resend_and_resumes_without_duplicates(self):
+        transcript = "第一段。" * 1000 + "\n\n" + "第二段。" * 1000
+        bot, sent = self._recording_bot(fail_at={2})
+        job = TelegramJob(
+            job_id="resend-me", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded", status_message_id=7,
+        )
+        manager, application = self._delivery_application(job, transcript, bot)
+
+        await _deliver_job(application, job.job_id)
+
+        self.assertEqual(manager.job.delivery_status, "failed")
+        self.assertEqual(manager.job.delivered_chunks, 1)
+        bot.send_document.assert_not_awaited()
+        edit = bot.edit_message_text.await_args.kwargs
+        self.assertIn("发送失败", edit["text"])
+        callbacks = [b.callback_data for row in edit["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("result:resend:resend-me", callbacks)
+
+        query = SimpleNamespace(
+            data="result:resend:resend-me",
+            answer=AsyncMock(),
+            message=FakeMessage(),
+            edit_message_text=AsyncMock(),
+        )
+        update = make_update(query.message)
+        update.callback_query = query
+        context = FakeContext(application.bot_data)
+        context.application = application
+        await handle_callback_query(update, context)
+        await asyncio.gather(*application.bot_data["delivery_tasks"].values())
+
+        self.assertEqual("".join(sent), transcript)
+        bot.send_document.assert_awaited_once()
+        self.assertEqual(manager.job.delivery_status, "delivered")
+
+    async def test_retry_after_is_honoured_during_delivery(self):
+        attempts = []
+
+        async def send_message(chat_id, text, **kwargs):
+            attempts.append(text)
+            if len(attempts) == 1:
+                raise RetryAfter(3)
+
+        bot = SimpleNamespace(
+            send_message=send_message,
+            send_document=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        job = TelegramJob(
+            job_id="flood", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded",
+        )
+        manager, application = self._delivery_application(job, "短结果", bot)
+
+        await _deliver_job(application, job.job_id)
+
+        self.assertEqual(attempts, ["短结果", "短结果"])
+        sleep = application.bot_data["chat_sender"]._sleep
+        sleep.assert_any_await(3.5)
+        self.assertEqual(manager.job.delivery_status, "delivered")
+
+    async def test_incomplete_result_is_flagged_on_status_card(self):
+        bot, _sent = self._recording_bot()
+        job = TelegramJob(
+            job_id="cut", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded", status_message_id=7,
+        )
+        _manager, application = self._delivery_application(
+            job, "被截断的", bot, finish_reason="MAX_TOKENS"
+        )
+
+        await _deliver_job(application, job.job_id)
+
+        self.assertIn("不完整", bot.edit_message_text.await_args.kwargs["text"])
+        self.assertIn("不完整", bot.send_document.await_args.kwargs["caption"])
+
+    async def test_restart_resumes_pending_delivery_from_saved_progress(self):
+        transcript = "第一段。" * 1000 + "\n\n" + "第二段。" * 1000
+        bot, sent = self._recording_bot()
+        job = TelegramJob(
+            job_id="resume", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded",
+            delivery_status="sending", delivered_chunks=1,
+        )
+        manager, application = self._delivery_application(job, transcript, bot)
+
+        self.assertEqual(_resume_undelivered(application), 1)
+        await asyncio.gather(*application.bot_data["delivery_tasks"].values())
+
+        store = application.bot_data["result_store"]
+        chunks = split_telegram_text(store.load("resume").transcript)
+        self.assertEqual(sent, chunks[1:])
+        self.assertEqual(manager.job.delivery_status, "delivered")
 
     async def test_terminal_timeout_logs_one_safe_structured_record(self):
         application = SimpleNamespace(

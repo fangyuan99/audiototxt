@@ -238,6 +238,25 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(manager.get(recent.job_id))
         self.assertEqual(manager.get(active.job_id).status, "queued")
 
+    async def test_delivery_progress_survives_restart(self):
+        async def executor(job, cancelled):
+            return "ok"
+
+        path = self.root / "jobs.json"
+        manager = TelegramJobManager(JobStore(path), executor)
+        pending = manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="a")
+        done = manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="b")
+        manager._set_status(pending.job_id, "succeeded")
+        manager._set_status(done.job_id, "succeeded")
+        manager.update_delivery(pending.job_id, delivery_status="sending", delivered_chunks=2)
+        manager.update_delivery(done.job_id, delivery_status="delivered")
+
+        reloaded = TelegramJobManager(JobStore(path), executor)
+
+        undelivered = reloaded.undelivered_jobs()
+        self.assertEqual([job.job_id for job in undelivered], [pending.job_id])
+        self.assertEqual(undelivered[0].delivered_chunks, 2)
+
     async def test_retry_clones_payload_with_new_id(self):
         manager = TelegramJobManager(
             JobStore(self.root / "jobs.json"), lambda job, cancelled: None

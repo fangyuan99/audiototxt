@@ -6,10 +6,8 @@ import json
 import logging
 import os
 import threading
-import time
 import traceback
 import uuid
-from collections import OrderedDict
 from dataclasses import replace
 from html import escape
 from inspect import iscoroutinefunction
@@ -73,6 +71,7 @@ from service_config import (
     migrate_legacy_user_settings,
     parse_api_keys,
 )
+from telegram_delivery import ChatSender, ResultStore, StoredResult
 from telegram_jobs import JobStore, TelegramJob, TelegramJobManager
 from transcription_service import (
     TaskCancelled,
@@ -174,64 +173,6 @@ def split_telegram_text(
         start += split_at
 
     return chunks
-
-
-class ResultCache:
-    def __init__(
-        self,
-        *,
-        max_entries: int = 64,
-        max_characters: int = 2_000_000,
-        ttl_seconds: float = 24 * 3600,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self.max_entries = max(1, int(max_entries))
-        self.max_characters = max(1, int(max_characters))
-        self.ttl_seconds = max(0.1, float(ttl_seconds))
-        self.clock = clock
-        self._items: OrderedDict[str, tuple[float, str]] = OrderedDict()
-        self._characters = 0
-        self._lock = threading.RLock()
-
-    def _evict_locked(self) -> None:
-        now = self.clock()
-        for key, (expires_at, value) in list(self._items.items()):
-            if expires_at > now:
-                continue
-            self._items.pop(key, None)
-            self._characters -= len(value)
-        while self._items and (
-            len(self._items) > self.max_entries
-            or (
-                self._characters > self.max_characters
-                and len(self._items) > 1
-            )
-        ):
-            _key, (_expires, value) = self._items.popitem(last=False)
-            self._characters -= len(value)
-
-    def put(self, key: str, value: str) -> None:
-        text = value or ""
-        with self._lock:
-            previous = self._items.pop(key, None)
-            if previous is not None:
-                self._characters -= len(previous[1])
-            self._items[key] = (self.clock() + self.ttl_seconds, text)
-            self._characters += len(text)
-            self._evict_locked()
-
-    def get(self, key: str) -> Optional[str]:
-        with self._lock:
-            self._evict_locked()
-            item = self._items.get(key)
-            if item is None:
-                return None
-            self._items.move_to_end(key)
-            return item[1]
-
-    def evict(self) -> None:
-        with self._lock:
-            self._evict_locked()
 
 
 def build_home_keyboard() -> InlineKeyboardMarkup:
@@ -385,6 +326,15 @@ def build_failed_job_keyboard(job_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("打开设置", callback_data="settings"),
                 InlineKeyboardButton("返回首页", callback_data="home"),
             ],
+        ]
+    )
+
+
+def build_resend_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("重新发送结果", callback_data=f"result:resend:{job_id}")],
+            [InlineKeyboardButton("返回首页", callback_data="home")],
         ]
     )
 
@@ -767,7 +717,10 @@ def _queue_text(manager: TelegramJobManager, user_id: int) -> tuple[str, InlineK
         job
         for job in manager.snapshot()
         if job.user_id == user_id
-        and job.status in {"queued", "running", "cancelling", "failed", "interrupted"}
+        and (
+            job.status in {"queued", "running", "cancelling", "failed", "interrupted"}
+            or (job.status == "succeeded" and job.delivery_status == "failed")
+        )
     ][-10:]
     if not jobs:
         return "<b>任务队列</b>\n当前没有任务。", build_home_keyboard()
@@ -777,6 +730,7 @@ def _queue_text(manager: TelegramJobManager, user_id: int) -> tuple[str, InlineK
         "cancelling": "取消中",
         "failed": "失败",
         "interrupted": "已中断",
+        "succeeded": "发送失败",
     }
     lines = ["<b>最近任务</b>"]
     rows = []
@@ -793,6 +747,10 @@ def _queue_text(manager: TelegramJobManager, user_id: int) -> tuple[str, InlineK
         elif job.status in {"failed", "interrupted"}:
             rows.append(
                 [InlineKeyboardButton(f"重试 {job.job_id[:8]}", callback_data=f"job:retry:{job.job_id}")]
+            )
+        elif job.status == "succeeded":
+            rows.append(
+                [InlineKeyboardButton(f"重发 {job.job_id[:8]}", callback_data=f"result:resend:{job.job_id}")]
             )
     rows.append([InlineKeyboardButton("⬅️ 返回首页", callback_data="home")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -1039,22 +997,23 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             build_cancel_job_keyboard(retried.job_id),
         )
         return
-    if data.startswith("result:full:"):
-        job_id = data.split(":", 2)[-1]
+    if data.startswith(("result:full:", "result:resend:")):
+        _prefix, action, job_id = data.split(":", 2)
         job = manager.get(job_id)
-        if job is None or job.user_id != user.id:
+        if job is None or job.user_id != user.id or job.status != "succeeded":
             await query.message.reply_text("结果不存在或无权访问。")
             return
-        cache: ResultCache = context.application.bot_data["result_cache"]
-        transcript = cache.get(job_id)
-        if transcript is None:
+        store: ResultStore = context.application.bot_data["result_store"]
+        if store.load(job_id) is None:
             await query.message.reply_text("结果已过期，请重新转写。")
             return
-        for chunk in split_telegram_text(transcript):
-            await context.bot.send_message(
-                chat_id=job.chat_id,
-                text=chunk,
-            )
+        if action == "full":
+            # Resend the text messages only; the TXT file already arrived.
+            changes = {"delivered_chunks": 0, "document_sent": True}
+        else:
+            changes = {}
+        if not _schedule_delivery(context.application, job_id, **changes):
+            await query.message.reply_text("结果正在发送中，请稍候。")
         return
 
 
@@ -1396,7 +1355,6 @@ _STATUS_LABELS = {
     "extracting": "正在抽取音频",
     "retrying": "临时失败，正在重试",
     "transcribing": "正在转写",
-    "delivering": "正在发送结果",
 }
 
 
@@ -1475,8 +1433,21 @@ async def _execute_job(
             )
         if cancelled():
             raise TaskCancelled("任务已取消。")
-        on_status("delivering")
-        await _deliver_result(application, job, result)
+        store: ResultStore = application.bot_data["result_store"]
+        store.save(
+            job.job_id,
+            result.transcript or "",
+            filename_stem=result.filename_stem,
+            finish_reason=result.finish_reason,
+        )
+        # Delivery runs separately so a Telegram failure never re-transcribes.
+        manager.update_delivery(
+            job.job_id,
+            delivery_status="pending",
+            delivered_chunks=0,
+            document_sent=False,
+        )
+        _remove_paths(result.cleanup_paths)
         return result
     except asyncio.CancelledError:
         raise
@@ -1534,47 +1505,116 @@ def _remove_paths(paths) -> None:
             )
 
 
-async def _deliver_result(
-    application: Application,
-    job: TelegramJob,
-    result: TranscriptionResult,
-) -> None:
-    cache: ResultCache = application.bot_data["result_cache"]
-    cache.put(job.job_id, result.transcript)
-    transcript = result.transcript or ""
-    transcript_chunks = split_telegram_text(transcript)
-    is_long = len(transcript_chunks) > 1
-    paths: BotPaths = application.bot_data["paths"]
-    output_path = paths.outputs_dir / (
-        f"{job.job_id}_"
-        f"{sanitize_upload_name(result.filename_stem, default='transcript')}.txt"
-    )
-    delivered = False
-    try:
-        for chunk in transcript_chunks:
-            await application.bot.send_message(
-                chat_id=job.chat_id,
-                text=chunk,
-            )
-        output_path.write_text(transcript, encoding="utf-8")
-        with output_path.open("rb") as handle:
-            await application.bot.send_document(
-                chat_id=job.chat_id,
-                document=handle,
-                filename=f"{result.filename_stem}.txt",
-                caption="转写完成。",
-            )
-        delivered = True
-    finally:
-        output_path.unlink(missing_ok=True)
-        if delivered:
-            _remove_paths(result.cleanup_paths)
+def _schedule_delivery(application: Application, job_id: str, **changes) -> bool:
+    """Start delivering a stored result in the background.
 
+    Returns False when a delivery for this job is already running.
+    """
+    tasks: dict[str, asyncio.Task] = application.bot_data.setdefault(
+        "delivery_tasks", {}
+    )
+    existing = tasks.get(job_id)
+    if existing is not None and not existing.done():
+        return False
+    manager: TelegramJobManager = application.bot_data["job_manager"]
+    manager.update_delivery(job_id, delivery_status="pending", **changes)
+    task = asyncio.create_task(
+        _deliver_job(application, job_id), name=f"telegram-deliver-{job_id[:8]}"
+    )
+    tasks[job_id] = task
+
+    def _forget(finished: asyncio.Task) -> None:
+        if tasks.get(job_id) is finished:
+            tasks.pop(job_id, None)
+
+    task.add_done_callback(_forget)
+    return True
+
+
+def render_result_completion(stored: StoredResult) -> str:
+    text = "<b>转写完成</b>\n结果已发送。"
+    if stored.incomplete:
+        text += (
+            f"\n⚠️ 结果可能不完整（结束原因：{html_code(stored.finish_reason)}），"
+            "末尾内容可能被截断。"
+        )
+    return text
+
+
+async def _deliver_job(application: Application, job_id: str) -> None:
+    manager: TelegramJobManager = application.bot_data["job_manager"]
+    store: ResultStore = application.bot_data["result_store"]
+    sender: ChatSender = application.bot_data["chat_sender"]
+    job = manager.get(job_id)
+    if job is None:
+        return
+    stored = store.load(job_id)
+    if stored is None:
+        manager.update_delivery(job_id, delivery_status="failed")
+        await _safe_edit_status(
+            application, job, "<b>结果已过期</b>\n请重新转写。", build_home_keyboard()
+        )
+        return
+    chunks = split_telegram_text(stored.transcript)
+    chat_id = job.chat_id
+    try:
+        async with sender.chat_lock(chat_id):
+            job = manager.update_delivery(job_id, delivery_status="sending") or job
+            await _safe_edit_status(
+                application,
+                job,
+                f"<b>正在发送结果</b>\n任务：{html_code(job_id[:8])}",
+            )
+            for index in range(min(job.delivered_chunks, len(chunks)), len(chunks)):
+                await sender.send(
+                    chat_id,
+                    lambda text=chunks[index]: application.bot.send_message(
+                        chat_id=chat_id, text=text
+                    ),
+                )
+                manager.update_delivery(job_id, delivered_chunks=index + 1)
+            if not job.document_sent:
+                caption = (
+                    "转写完成（结果可能不完整）。" if stored.incomplete else "转写完成。"
+                )
+
+                async def send_document():
+                    # Reopen per attempt so a retry uploads from the start.
+                    with store.text_path(job_id).open("rb") as handle:
+                        return await application.bot.send_document(
+                            chat_id=chat_id,
+                            document=handle,
+                            filename=f"{stored.filename_stem}.txt",
+                            caption=caption,
+                        )
+
+                await sender.send(chat_id, send_document)
+                manager.update_delivery(job_id, document_sent=True)
+            manager.update_delivery(job_id, delivery_status="delivered")
+    except asyncio.CancelledError:
+        # Left as "sending" so the next start resumes from the last chunk.
+        raise
+    except Exception as exc:
+        logger.warning(
+            "telegram_delivery_failed job_id=%s error_type=%s detail=%s",
+            job_id,
+            type(exc).__name__,
+            sanitize_error_detail(exc),
+        )
+        manager.update_delivery(job_id, delivery_status="failed")
+        await _safe_edit_status(
+            application,
+            job,
+            f"<b>结果已保存，但发送失败</b>\n任务：{html_code(job_id[:8])}\n"
+            "可稍后点击“重新发送结果”，无需重新转写。",
+            build_resend_keyboard(job_id),
+        )
+        return
     await _safe_edit_status(
         application,
         job,
-        "<b>转写完成</b>\n结果已发送。",
-        build_result_keyboard(job.job_id, include_full=is_long),
+        render_result_completion(stored),
+        build_result_keyboard(job_id, include_full=len(chunks) > 1),
     )
 
 
@@ -1613,7 +1653,7 @@ async def _on_job_update(
             build_cancel_job_keyboard(job.job_id),
         )
     elif event == "succeeded":
-        return
+        _schedule_delivery(application, job.job_id)
     elif event == "cancelled":
         cleanup_paths = [job.audio_path] if job.audio_path else []
         if isinstance(payload, TranscriptionResult):
@@ -1673,7 +1713,6 @@ async def handle_telegram_error(
 async def _maintenance_loop(application: Application) -> None:
     while True:
         try:
-            application.bot_data["result_cache"].evict()
             manager: TelegramJobManager = application.bot_data["job_manager"]
             active_paths = {
                 job.audio_path
@@ -1716,12 +1755,26 @@ async def initialize_services(application: Application) -> None:
         except Exception:
             logger.warning("Unable to notify interrupted job %s", job.job_id)
 
+    _resume_undelivered(application)
+
+
+def _resume_undelivered(application: Application) -> int:
+    """Resume deliveries that were pending or in flight before a restart."""
+    jobs = application.bot_data["job_manager"].undelivered_jobs()
+    for job in jobs:
+        _schedule_delivery(application, job.job_id)
+    return len(jobs)
+
 
 async def shutdown_services(application: Application) -> None:
     task = application.bot_data.pop("maintenance_task", None)
     if task is not None:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+    delivery_tasks = list(application.bot_data.pop("delivery_tasks", {}).values())
+    for delivery_task in delivery_tasks:
+        delivery_task.cancel()
+    await asyncio.gather(*delivery_tasks, return_exceptions=True)
     manager = application.bot_data.get("job_manager")
     if manager is not None:
         await manager.stop()
@@ -1786,7 +1839,8 @@ def build_application() -> Application:
             "media_policy": media_policy,
             "transcription_service": transcription_service,
             "job_manager": job_manager,
-            "result_cache": ResultCache(),
+            "result_store": ResultStore(paths.outputs_dir / "results"),
+            "chat_sender": ChatSender(),
             "allowed_user_ids": allowed_user_ids,
             "bot_secret": secret,
             "key_validator": _validate_api_key,
