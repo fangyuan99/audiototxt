@@ -257,6 +257,102 @@ class TranscriptionServiceTest(unittest.TestCase):
 
             self.assertFalse(source.exists())
 
+    def test_cancel_mid_stream_aborts_without_rotating_keys(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source.mp3"
+            source.write_bytes(b"audio")
+            service, functions = self.make_service(root)
+            cancelled = {"value": False}
+            keys = []
+
+            def transcribe_audio(**kwargs):
+                keys.append(kwargs["api_key"])
+                kwargs["on_chunk"]("first words")
+                cancelled["value"] = True
+                kwargs["on_chunk"]("never collected")
+                return "late result"
+
+            functions.transcribe_audio = transcribe_audio
+            with self.assertRaises(TaskCancelled):
+                service.execute(
+                    TranscriptionRequest(source_type="audio", audio_path=source),
+                    cancelled=lambda: cancelled["value"],
+                )
+
+            self.assertEqual(keys, ["key-a"])
+            self.assertTrue(
+                all(status.failure_count == 0 for status in service.key_pool.statuses())
+            )
+
+    def test_deadline_mid_stream_aborts_youtube_without_rotating_keys(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            service, functions = self.make_service(root)
+            clock = {"now": 0.0}
+            deadline = TaskDeadline(10, clock=lambda: clock["now"])
+            keys = []
+
+            def transcribe_youtube(**kwargs):
+                keys.append(kwargs["api_key"])
+                clock["now"] = 11.0
+                try:
+                    kwargs["on_chunk"]("words")
+                except Exception as exc:
+                    raise RuntimeError("YouTube 直连转写失败") from exc
+                return "late"
+
+            functions.transcribe_youtube = transcribe_youtube
+            with self.assertRaises(RuntimeError) as raised:
+                service.execute(
+                    TranscriptionRequest(
+                        source_type="youtube",
+                        text_input="https://www.youtube.com/watch?v=abc",
+                    ),
+                    deadline=deadline,
+                )
+
+            self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+            self.assertEqual(keys, ["key-a"])
+
+    def test_finish_reason_is_reported_on_result(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source.mp3"
+            source.write_bytes(b"audio")
+            service, functions = self.make_service(root)
+
+            def transcribe_audio(**kwargs):
+                kwargs["on_chunk"]("partial")
+                kwargs["on_finish"]("MAX_TOKENS")
+                return "partial"
+
+            functions.transcribe_audio = transcribe_audio
+            result = service.execute(
+                TranscriptionRequest(source_type="audio", audio_path=source)
+            )
+
+            self.assertEqual(result.finish_reason, "MAX_TOKENS")
+            self.assertTrue(result.incomplete)
+
+    def test_normal_stop_is_complete(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "source.mp3"
+            source.write_bytes(b"audio")
+            service, functions = self.make_service(root)
+
+            def transcribe_audio(**kwargs):
+                kwargs["on_finish"]("STOP")
+                return "done"
+
+            functions.transcribe_audio = transcribe_audio
+            result = service.execute(
+                TranscriptionRequest(source_type="audio", audio_path=source)
+            )
+
+            self.assertFalse(result.incomplete)
+
 
 if __name__ == "__main__":
     unittest.main()

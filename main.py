@@ -266,24 +266,51 @@ def wait_for_file_active(client, file_obj, timeout_seconds: int = 120) -> None:
             pass
 
 
-def _collect_stream_text(response_stream, on_chunk=None) -> str:
-    """Collect streamed Gemini text while emitting only new deltas."""
+def _finish_reason_name(chunk) -> str:
+    try:
+        candidates = getattr(chunk, "candidates", None) or []
+        reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+    except Exception:
+        return ""
+    if reason is None:
+        return ""
+    name = getattr(reason, "name", None) or str(reason)
+    return name.rsplit(".", 1)[-1].upper()
+
+
+def _chunk_text(chunk) -> str:
+    text_piece = getattr(chunk, "text", None)
+    if text_piece:
+        return text_piece
+    try:
+        candidates = getattr(chunk, "candidates", [])
+        if candidates and candidates[0].content and candidates[0].content.parts:
+            return "".join(
+                part.text
+                for part in candidates[0].content.parts
+                if hasattr(part, "text")
+            )
+    except Exception:
+        pass
+    return ""
+
+
+def _collect_stream_text(response_stream, on_chunk=None, on_finish=None) -> str:
+    """Collect streamed Gemini text while emitting only new deltas.
+
+    ``on_chunk`` may raise to abort the stream (cancellation or deadline).
+    ``on_finish`` receives the provider finish reason, e.g. ``STOP`` or
+    ``MAX_TOKENS``, or an empty string when the provider did not report one.
+    """
     emitted_text = ""
     full_parts = []
-    for chunk in response_stream:
-        text_piece = getattr(chunk, "text", None)
-        if not text_piece:
-            try:
-                candidates = getattr(chunk, "candidates", [])
-                if candidates and candidates[0].content and candidates[0].content.parts:
-                    text_piece = "".join(
-                        part.text
-                        for part in candidates[0].content.parts
-                        if hasattr(part, "text")
-                    )
-            except Exception:
-                text_piece = None
-        if text_piece:
+    finish_reason = ""
+    try:
+        for chunk in response_stream:
+            finish_reason = _finish_reason_name(chunk) or finish_reason
+            text_piece = _chunk_text(chunk)
+            if not text_piece:
+                continue
             if emitted_text and text_piece.startswith(emitted_text):
                 delta = text_piece[len(emitted_text):]
             else:
@@ -295,7 +322,15 @@ def _collect_stream_text(response_stream, on_chunk=None) -> str:
                     print(delta, end="", flush=True)
                 full_parts.append(delta)
                 emitted_text += delta
-
+    finally:
+        close = getattr(response_stream, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+    if on_finish:
+        on_finish(finish_reason)
     return "".join(full_parts).strip()
 
 
@@ -370,6 +405,7 @@ def transcribe_audio_streaming(
     vertex_location: Optional[str] = None,
     full_prompt_override: Optional[str] = None,
     request_timeout_seconds: Optional[float] = None,
+    on_finish=None,
 ) -> str:
     """Use Gemini to transcribe an audio file into text with streaming output.
 
@@ -432,7 +468,9 @@ def transcribe_audio_streaming(
             config=config,
         )
 
-        transcript = _collect_stream_text(response_stream, on_chunk=on_chunk)
+        transcript = _collect_stream_text(
+            response_stream, on_chunk=on_chunk, on_finish=on_finish
+        )
         try:
             print(f"转写完成（约 {len(transcript)} 字符）", file=sys.stderr)
         except Exception:
@@ -459,6 +497,7 @@ def transcribe_youtube_url_streaming(
     media_resolution: Optional[str] = "low",
     full_prompt_override: Optional[str] = None,
     request_timeout_seconds: Optional[float] = None,
+    on_finish=None,
 ) -> str:
     """Use Gemini to transcribe a public YouTube URL directly without downloading."""
     from google.genai import types
@@ -486,7 +525,9 @@ def transcribe_youtube_url_streaming(
             contents=[full_prompt, video_part],
             config=config,
         )
-        transcript = _collect_stream_text(response_stream, on_chunk=on_chunk)
+        transcript = _collect_stream_text(
+            response_stream, on_chunk=on_chunk, on_finish=on_finish
+        )
         try:
             print(f"转写完成（约 {len(transcript)} 字符）", file=sys.stderr)
         except Exception:

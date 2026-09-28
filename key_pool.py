@@ -214,7 +214,18 @@ class GeminiKeyPool:
             record.disabled_until = 0.0
             record.reason = ""
 
-    def run(self, operation: Callable[[str], T]) -> T:
+    def run(
+        self,
+        operation: Callable[[str], T],
+        *,
+        should_abort: Optional[Callable[[], bool]] = None,
+    ) -> T:
+        """Run ``operation`` with failover across healthy keys.
+
+        When ``should_abort`` reports true after a failure (task cancelled or
+        out of time), the error is re-raised as-is: the key is not penalized
+        and no further keys are tried.
+        """
         attempted: set[str] = set()
         last_error: Optional[BaseException] = None
         while True:
@@ -229,6 +240,8 @@ class GeminiKeyPool:
             try:
                 result = operation(lease.key)
             except Exception as exc:
+                if should_abort is not None and should_abort():
+                    raise
                 kind = self._classify(exc)
                 if kind == "deterministic":
                     raise DeterministicGeminiError(str(exc)) from exc
