@@ -14,6 +14,7 @@ from channel_health import ChannelHealthResult
 from key_pool import GeminiKeyPool
 from service_config import GlobalConfigStore
 from telegram_bot import (
+    _download_telegram_audio,
     _history_text,
     render_job_progress,
     _settings_changed,
@@ -36,8 +37,9 @@ from telegram_bot import (
     start_command,
 )
 from telegram_delivery import ChatSender, ResultStore
+from media_policy import DownloadLimitExceeded
 from telegram_jobs import JobStore, TelegramJob, TelegramJobManager
-from transcription_service import TranscriptionResult
+from transcription_service import TaskCancelled, TranscriptionResult
 
 
 class FakeMessage:
@@ -69,6 +71,11 @@ class FakeContext:
         self.application = SimpleNamespace(bot_data=bot_data)
         self.user_data = {}
         self.args = []
+
+
+async def drain_background(bot_data):
+    tasks = list(bot_data.get("background_tasks", ()))
+    await asyncio.gather(*tasks)
 
 
 def make_update(message, user_id=42, chat_type="private"):
@@ -190,6 +197,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         handled = await _handle_setting_input(
             make_update(message), context, "vertex_json", message.text
         )
+        await drain_background(self.bot_data)
 
         stored = self.config_store.get()
         self.assertTrue(handled)
@@ -204,6 +212,35 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
             + [edit[0] for _, _, reply in message.replies for edit in reply.edits]
         )
         self.assertIn("当前渠道可用", rendered)
+
+    async def test_key_validation_runs_without_blocking_the_handler(self):
+        import threading
+
+        release = threading.Event()
+
+        def validator(key):
+            release.wait(5)
+            return key != "bad-key"
+
+        self.bot_data["key_validator"] = validator
+        message = FakeMessage("good-key-1,bad-key,good-key-2")
+        context = FakeContext(self.bot_data)
+        context.user_data[PENDING_ACTION_KEY] = "keys_replace"
+
+        handled = await _handle_setting_input(
+            make_update(message), context, "keys_replace", message.text
+        )
+
+        self.assertTrue(handled)
+        self.assertNotIn(PENDING_ACTION_KEY, context.user_data)
+        self.assertEqual(self.config_store.get().gemini_api_keys, [])
+        self.assertIn("正在验证 3 个 Key", message.replies[-1][0])
+
+        release.set()
+        await drain_background(self.bot_data)
+        self.assertEqual(
+            self.config_store.get().gemini_api_keys, ["good-key-1", "good-key-2"]
+        )
 
     async def test_vertex_project_edit_probes_vertex_even_when_gemini_selected(self):
         captured = []
@@ -232,6 +269,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         await _handle_setting_input(
             make_update(message), context, "vertex_project", message.text
         )
+        await drain_background(self.bot_data)
 
         self.assertEqual(self.config_store.get().auth_mode, "gemini_api_key")
         self.assertEqual(captured[-1].auth_mode, "vertex_ai_json")
@@ -273,6 +311,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         )
 
         await handle_callback_query(update, context)
+        await drain_background(self.bot_data)
 
         self.assertEqual(captured[-1].auth_mode, "vertex_ai_json")
         self.assertEqual(
@@ -316,6 +355,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         )
 
         await handle_callback_query(update, context)
+        await drain_background(self.bot_data)
 
         self.assertEqual(context.user_data[PENDING_ACTION_KEY], "model_manual")
         self.assertIn("直接发送模型名称", message.replies[-1][0])
@@ -720,6 +760,131 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(store.exists(kept.job_id))
         self.assertEqual(manager.get(kept.job_id).delivery_status, "deleted")
+
+    def _download_application(self, telegram_file, *, transport=None, max_bytes=10**7):
+        uploads = self.root / "uploads"
+        uploads.mkdir(exist_ok=True)
+        return SimpleNamespace(
+            bot=SimpleNamespace(get_file=AsyncMock(return_value=telegram_file)),
+            bot_data={
+                "media_policy": SimpleNamespace(max_media_bytes=max_bytes),
+                "paths": SimpleNamespace(uploads_dir=uploads),
+                "download_transport": transport,
+            },
+        )
+
+    def _download_job(self):
+        return TelegramJob(
+            job_id="dl", sequence=1, user_id=42, chat_id=42, source_type="audio",
+            telegram_file_id="file-abc", original_filename="talk.m4a",
+        )
+
+    async def test_download_streams_in_chunks_and_reports_bytes(self):
+        import httpx
+
+        body = b"a" * (600 * 1024)
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, content=body, headers={"content-length": str(len(body))}
+            )
+        )
+        telegram_file = SimpleNamespace(
+            file_size=len(body), file_path="https://api.telegram.org/file/botTOKEN/a.m4a"
+        )
+        application = self._download_application(telegram_file, transport=transport)
+        progress = []
+
+        path = await _download_telegram_audio(
+            application, self._download_job(),
+            on_progress=lambda received, total: progress.append((received, total)),
+        )
+
+        self.assertEqual(path.read_bytes(), body)
+        self.assertEqual(progress[-1], (len(body), len(body)))
+        self.assertGreater(len(progress), 1)
+
+    async def test_download_cancel_mid_stream_removes_partial_file(self):
+        import httpx
+
+        body = b"a" * (600 * 1024)
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, content=body))
+        telegram_file = SimpleNamespace(
+            file_size=0, file_path="https://api.telegram.org/file/botTOKEN/a.m4a"
+        )
+        application = self._download_application(telegram_file, transport=transport)
+        seen = []
+
+        with self.assertRaises(TaskCancelled):
+            await _download_telegram_audio(
+                application, self._download_job(),
+                cancelled=lambda: bool(seen),
+                on_progress=lambda received, total: seen.append(received),
+            )
+
+        self.assertEqual(list((self.root / "uploads").iterdir()), [])
+
+    async def test_download_errors_never_expose_the_token_url(self):
+        import httpx
+
+        def fail(request):
+            raise httpx.ConnectError(f"cannot reach {request.url}")
+
+        telegram_file = SimpleNamespace(
+            file_size=0, file_path="https://api.telegram.org/file/botSECRET/a.m4a"
+        )
+        application = self._download_application(
+            telegram_file, transport=httpx.MockTransport(fail)
+        )
+
+        with self.assertRaises(ConnectionError) as caught:
+            await _download_telegram_audio(application, self._download_job())
+
+        self.assertNotIn("SECRET", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    async def test_download_over_limit_is_rejected_from_content_length(self):
+        import httpx
+
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"a" * 2048)
+        )
+        telegram_file = SimpleNamespace(
+            file_size=0, file_path="https://api.telegram.org/file/botTOKEN/a.m4a"
+        )
+        application = self._download_application(
+            telegram_file, transport=transport, max_bytes=1024
+        )
+
+        with self.assertRaises(DownloadLimitExceeded):
+            await _download_telegram_audio(application, self._download_job())
+        self.assertEqual(list((self.root / "uploads").iterdir()), [])
+
+    async def test_local_path_download_can_be_cancelled(self):
+        async def download_to_drive(custom_path):
+            await asyncio.sleep(30)
+
+        telegram_file = SimpleNamespace(
+            file_size=5, file_path="/var/lib/telegram-bot-api/a.m4a",
+            download_to_drive=download_to_drive,
+        )
+        application = self._download_application(telegram_file)
+        started = asyncio.get_running_loop().time()
+
+        with self.assertRaises(TaskCancelled):
+            await _download_telegram_audio(
+                application, self._download_job(), cancelled=lambda: True
+            )
+
+        self.assertLess(asyncio.get_running_loop().time() - started, 5)
+
+    def test_progress_card_shows_download_bytes(self):
+        job = TelegramJob(job_id="abcdef123456", sequence=1, user_id=1, chat_id=1, source_type="audio")
+        text = render_job_progress(
+            job, "downloading", elapsed_seconds=3,
+            downloaded_bytes=3 * 1024 * 1024, total_bytes=12 * 1024 * 1024,
+        )
+        self.assertIn("已下载：3.0 MB / 12.0 MB", text)
 
     def _audio_job_application(self, service, bot):
         manager = SimpleNamespace(

@@ -665,6 +665,29 @@ def _validate_api_key(api_key: str) -> bool:
         client.close()
 
 
+def _spawn_background(bot_data: dict, coro, *, name: str) -> asyncio.Task:
+    """Run slow provider calls off the update handler.
+
+    Updates are processed one at a time, so awaiting a network probe in a
+    handler would stall every other message and button press.
+    """
+    tasks: set = bot_data.setdefault("background_tasks", set())
+    task = asyncio.create_task(coro, name=name)
+    tasks.add(task)
+
+    def _done(finished: asyncio.Task) -> None:
+        tasks.discard(finished)
+        if not finished.cancelled() and finished.exception() is not None:
+            logger.error(
+                "Background task %s failed: %s",
+                name,
+                sanitize_error_detail(finished.exception()),
+            )
+
+    task.add_done_callback(_done)
+    return task
+
+
 async def _run_channel_health_check(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -718,32 +741,71 @@ async def _report_channel_health(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     settings_override: Optional[GlobalSettings] = None,
-) -> ChannelHealthResult:
+) -> None:
     settings = settings_override or context.application.bot_data["config_store"].get()
     model_name = settings.model_name.strip() or DEFAULT_MODEL_NAME
     progress = await _reply_html(
         message,
         f"<b>正在测试渠道</b>\n使用 {html_code(model_name)} 发送 hi……",
     )
-    result = await _run_channel_health_check(
-        context, settings_override=settings_override
+
+    async def probe() -> None:
+        result = await _run_channel_health_check(
+            context, settings_override=settings_override
+        )
+        rendered = render_channel_health(result, settings)
+        try:
+            await progress.edit_text(
+                rendered,
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_settings_keyboard(),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.debug("Unable to edit channel health progress message.")
+            await _reply_html(
+                message,
+                rendered,
+                reply_markup=build_settings_keyboard(),
+            )
+
+    _spawn_background(
+        context.application.bot_data, probe(), name="telegram-channel-health"
     )
-    rendered = render_channel_health(result, settings)
+
+
+async def _show_model_menu(query, context: ContextTypes.DEFAULT_TYPE, settings) -> None:
+    key_pool: GeminiKeyPool = context.application.bot_data["key_pool"]
     try:
-        await progress.edit_text(
-            rendered,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_settings_keyboard(),
-            disable_web_page_preview=True,
+        models = await asyncio.to_thread(
+            context.application.bot_data.get(
+                "model_catalog_loader", list_current_channel_models
+            ),
+            settings,
+            key_pool,
         )
-    except Exception:
-        logger.debug("Unable to edit channel health progress message.")
-        await _reply_html(
-            message,
-            rendered,
-            reply_markup=build_settings_keyboard(),
+    except Exception as exc:
+        diagnosis = diagnose_exception(exc)
+        logger.warning(
+            "model_catalog_failed auth_mode=%s category=%s error_type=%s detail=%s",
+            settings.auth_mode,
+            diagnosis.code,
+            diagnosis.error_type,
+            diagnosis.log_detail or "-",
         )
-    return result
+        models = []
+    context.user_data[MODEL_CHOICES_KEY] = models
+    if not models:
+        context.user_data[PENDING_ACTION_KEY] = "model_manual"
+        await query.message.reply_text(
+            "无法从当前渠道读取可用模型，请直接发送模型名称。"
+        )
+        return
+    await _edit_query(
+        query,
+        f"<b>选择模型</b>\n当前：{html_code(settings.model_name)}",
+        build_model_keyboard(models),
+    )
 
 
 async def _edit_query(query, text: str, markup: InlineKeyboardMarkup) -> None:
@@ -894,11 +956,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"<b>正在测试当前渠道</b>\n使用 {html_code(model_name)} 发送 hi……",
             build_settings_keyboard(),
         )
-        result = await _run_channel_health_check(context)
-        await _edit_query(
-            query,
-            render_channel_health(result, settings),
-            build_settings_keyboard(),
+        async def probe() -> None:
+            result = await _run_channel_health_check(context)
+            await _edit_query(
+                query,
+                render_channel_health(result, settings),
+                build_settings_keyboard(),
+            )
+
+        _spawn_background(
+            context.application.bot_data, probe(), name="telegram-channel-test"
         )
         return
     if data == "queue":
@@ -928,35 +995,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if data == "settings:model":
         settings = config_store.get()
-        try:
-            models = await asyncio.to_thread(
-                context.application.bot_data.get(
-                    "model_catalog_loader", list_current_channel_models
-                ),
-                settings,
-                key_pool,
-            )
-        except Exception as exc:
-            diagnosis = diagnose_exception(exc)
-            logger.warning(
-                "model_catalog_failed auth_mode=%s category=%s error_type=%s detail=%s",
-                settings.auth_mode,
-                diagnosis.code,
-                diagnosis.error_type,
-                diagnosis.log_detail or "-",
-            )
-            models = []
-        context.user_data[MODEL_CHOICES_KEY] = models
-        if not models:
-            context.user_data[PENDING_ACTION_KEY] = "model_manual"
-            await query.message.reply_text(
-                "无法从当前渠道读取可用模型，请直接发送模型名称。"
-            )
-            return
-        await _edit_query(
-            query,
-            f"<b>选择模型</b>\n当前：{html_code(settings.model_name)}",
-            build_model_keyboard(models),
+        await _edit_query(query, "<b>正在读取模型列表……</b>", build_settings_keyboard())
+        _spawn_background(
+            context.application.bot_data,
+            _show_model_menu(query, context, settings),
+            name="telegram-model-catalog",
         )
         return
     if data.startswith("model:page:"):
@@ -1174,6 +1217,54 @@ async def _handle_password(
     )
 
 
+KEY_VALIDATION_CONCURRENCY = 4
+
+
+async def _validate_and_store_keys(
+    message: Message,
+    progress,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    keys: list[str],
+) -> None:
+    store: GlobalConfigStore = context.application.bot_data["config_store"]
+    pool: GeminiKeyPool = context.application.bot_data["key_pool"]
+    validator = context.application.bot_data.get("key_validator", _validate_api_key)
+    limit = asyncio.Semaphore(KEY_VALIDATION_CONCURRENCY)
+
+    async def check(key: str) -> bool:
+        async with limit:
+            try:
+                return bool(await asyncio.to_thread(validator, key))
+            except Exception:
+                return False
+
+    results = await asyncio.gather(*(check(key) for key in keys))
+    valid = [key for key, ok in zip(keys, results) if ok]
+    invalid_count = len(keys) - len(valid)
+
+    async def report(text: str, markup=None) -> None:
+        try:
+            await progress.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            await _reply_html(message, text, reply_markup=markup)
+
+    if not valid:
+        context.user_data[PENDING_ACTION_KEY] = action
+        await report("新 Key 全部验证失败，旧配置保持不变。可以重新发送。")
+        return
+    settings = (
+        store.replace_api_keys(valid)
+        if action == "keys_replace"
+        else store.append_api_keys(valid)
+    )
+    pool.sync(settings.gemini_api_keys)
+    await report(
+        f"Key 池已更新：{len(settings.gemini_api_keys)} 个可配置 Key；本次忽略 {invalid_count} 个失败项。",
+        build_settings_keyboard(),
+    )
+
+
 async def _handle_setting_input(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1196,32 +1287,14 @@ async def _handle_setting_input(
         if not keys:
             await _reply_html(message, "没有检测到有效格式的 Key，旧配置保持不变。")
             return True
-        validator = context.application.bot_data.get("key_validator", _validate_api_key)
-        valid = []
-        invalid_count = 0
-        for key in keys:
-            try:
-                is_valid = await asyncio.to_thread(validator, key)
-            except Exception:
-                is_valid = False
-            if is_valid:
-                valid.append(key)
-            else:
-                invalid_count += 1
-        if not valid:
-            await _reply_html(message, "新 Key 全部验证失败，旧配置保持不变。")
-            return True
-        settings = (
-            store.replace_api_keys(valid)
-            if action == "keys_replace"
-            else store.append_api_keys(valid)
-        )
-        pool.sync(settings.gemini_api_keys)
+        # Cleared now so messages sent during validation are not taken as
+        # more keys; restored if every key fails.
         context.user_data.pop(PENDING_ACTION_KEY, None)
-        await _reply_html(
-            message,
-            f"Key 池已更新：{len(settings.gemini_api_keys)} 个可配置 Key；本次忽略 {invalid_count} 个失败项。",
-            reply_markup=build_settings_keyboard(),
+        progress = await _reply_html(message, f"<b>正在验证 {len(keys)} 个 Key……</b>")
+        _spawn_background(
+            context.application.bot_data,
+            _validate_and_store_keys(message, progress, context, action, keys),
+            name="telegram-key-validation",
         )
         return True
     if action == "model_manual":
@@ -1566,6 +1639,10 @@ PROGRESS_EDIT_INTERVAL_SECONDS = 5.0
 PROGRESS_PREVIEW_CHARS = 120
 
 
+def _format_megabytes(size: int) -> str:
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
 def _format_elapsed(seconds: float) -> str:
     total = max(0, int(seconds))
     minutes, secs = divmod(total, 60)
@@ -1579,6 +1656,8 @@ def render_job_progress(
     elapsed_seconds: float,
     characters: int = 0,
     tail: str = "",
+    downloaded_bytes: int = 0,
+    total_bytes: int = 0,
 ) -> str:
     """Status card for a running job. Shows real counters only, never an
     estimated percentage."""
@@ -1588,6 +1667,13 @@ def render_job_progress(
         f"任务：{html_code(job.job_id[:8])}{_snapshot_model_line(job.settings_snapshot)}",
         f"已用时：{_format_elapsed(elapsed_seconds)}",
     ]
+    if downloaded_bytes:
+        done = _format_megabytes(downloaded_bytes)
+        lines.append(
+            f"已下载：{done} / {_format_megabytes(total_bytes)}"
+            if total_bytes
+            else f"已下载：{done}"
+        )
     if characters:
         lines.append(f"已生成：{characters} 字")
     preview = " ".join(tail.split())[-PROGRESS_PREVIEW_CHARS:]
@@ -1613,7 +1699,14 @@ async def _execute_job(
         )
     )
     started = time.monotonic()
-    progress = {"characters": 0, "tail": "", "last_edit": float("-inf"), "closed": False}
+    progress = {
+        "characters": 0,
+        "tail": "",
+        "downloaded": 0,
+        "download_total": 0,
+        "last_edit": float("-inf"),
+        "closed": False,
+    }
     card_lock = asyncio.Lock()
 
     async def refresh_card() -> None:
@@ -1629,6 +1722,8 @@ async def _execute_job(
                     elapsed_seconds=time.monotonic() - started,
                     characters=progress["characters"],
                     tail=progress["tail"],
+                    downloaded_bytes=progress["downloaded"],
+                    total_bytes=progress["download_total"],
                 )
             await _safe_edit_status(
                 application, job, text, build_cancel_job_keyboard(job.job_id)
@@ -1650,8 +1745,21 @@ async def _execute_job(
             if status != "transcribing":
                 progress["characters"] = 0
                 progress["tail"] = ""
+            if status != "downloading":
+                progress["downloaded"] = 0
+                progress["download_total"] = 0
             progress["last_edit"] = time.monotonic()
         manager.update_stage(job.job_id, status)
+        schedule_refresh()
+
+    def on_download_progress(received: int, total: int) -> None:
+        now = time.monotonic()
+        with stage_lock:
+            progress["downloaded"] = received
+            progress["download_total"] = total
+            if now - progress["last_edit"] < interval:
+                return
+            progress["last_edit"] = now
         schedule_refresh()
 
     def on_progress(characters: int, tail: str) -> None:
@@ -1677,14 +1785,19 @@ async def _execute_job(
             not job.audio_path or not Path(job.audio_path).is_file()
         ):
             on_status("downloading")
-            downloaded = await _download_telegram_audio(application, job)
+            downloaded = await _download_telegram_audio(
+                application,
+                job,
+                cancelled=cancelled,
+                on_progress=on_download_progress,
+            )
             if cancelled():
                 downloaded.unlink(missing_ok=True)
                 raise TaskCancelled("任务已取消。")
             job = manager.set_audio_path(job.job_id, str(downloaded)) or replace(
                 job, audio_path=str(downloaded)
             )
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, TaskCancelled):
         raise
     except Exception as exc:
         raise JobExecutionFailure("downloading", diagnose_exception(exc)) from exc
@@ -1750,9 +1863,79 @@ async def _execute_job(
         raise JobExecutionFailure(stage, diagnosis) from exc
 
 
+DOWNLOAD_CHUNK_BYTES = 256 * 1024
+DOWNLOAD_CANCEL_POLL_SECONDS = 0.5
+
+
+async def _stream_telegram_file(
+    url: str,
+    destination: Path,
+    *,
+    max_bytes: int,
+    cancelled: Callable[[], bool],
+    on_progress: Callable[[int, int], None],
+    transport=None,
+) -> None:
+    """Download in chunks so cancellation and byte progress work mid-file."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, read=60.0), transport=transport
+        ) as client:
+            async with client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    raise ConnectionError(
+                        f"Telegram 文件下载失败（HTTP {response.status_code}）。"
+                    )
+                total = int(response.headers.get("content-length") or 0)
+                if total and total > max_bytes:
+                    raise DownloadLimitExceeded("音频文件超过服务端大小限制。")
+                received = 0
+                with destination.open("wb") as handle:
+                    async for chunk in response.aiter_bytes(DOWNLOAD_CHUNK_BYTES):
+                        if cancelled():
+                            raise TaskCancelled("任务已取消。")
+                        received += len(chunk)
+                        if received > max_bytes:
+                            raise DownloadLimitExceeded("音频文件超过服务端大小限制。")
+                        handle.write(chunk)
+                        on_progress(received, total)
+    except httpx.HTTPError as exc:
+        # The file URL embeds the bot token, so the original error (which
+        # may quote the URL) must not reach logs or the user.
+        raise ConnectionError(
+            f"Telegram 文件下载失败：{type(exc).__name__}"
+        ) from None
+
+
+async def _download_cancellable(
+    operation, cancelled: Callable[[], bool]
+) -> None:
+    """Run a download that cannot report progress, polling for cancel."""
+    task = asyncio.ensure_future(operation)
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {task}, timeout=DOWNLOAD_CANCEL_POLL_SECONDS
+            )
+            if done:
+                task.result()
+                return
+            if cancelled():
+                raise TaskCancelled("任务已取消。")
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 async def _download_telegram_audio(
     application: Application,
     job: TelegramJob,
+    *,
+    cancelled: Callable[[], bool] = lambda: False,
+    on_progress: Callable[[int, int], None] = lambda received, total: None,
 ) -> Path:
     if not job.telegram_file_id:
         raise FileNotFoundError("原音频已过期，请重新发送文件。")
@@ -1773,8 +1956,23 @@ async def _download_telegram_audio(
     file_size = int(getattr(telegram_file, "file_size", 0) or 0)
     if file_size and file_size > policy.max_media_bytes:
         raise DownloadLimitExceeded("音频文件超过服务端大小限制。")
+    file_url = str(getattr(telegram_file, "file_path", "") or "")
     try:
-        await telegram_file.download_to_drive(custom_path=str(destination))
+        if file_url.startswith(("https://", "http://")):
+            await _stream_telegram_file(
+                file_url,
+                destination,
+                max_bytes=policy.max_media_bytes,
+                cancelled=cancelled,
+                on_progress=on_progress,
+                transport=application.bot_data.get("download_transport"),
+            )
+        else:
+            # Local Bot API servers hand out file paths, not URLs.
+            await _download_cancellable(
+                telegram_file.download_to_drive(custom_path=str(destination)),
+                cancelled,
+            )
         if destination.stat().st_size > policy.max_media_bytes:
             raise DownloadLimitExceeded("音频文件超过服务端大小限制。")
     except BaseException:
@@ -2074,6 +2272,10 @@ async def shutdown_services(application: Application) -> None:
     if task is not None:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+    background_tasks = list(application.bot_data.pop("background_tasks", set()))
+    for background_task in background_tasks:
+        background_task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
     delivery_tasks = list(application.bot_data.pop("delivery_tasks", {}).values())
     for delivery_task in delivery_tasks:
         delivery_task.cancel()
