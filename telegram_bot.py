@@ -12,7 +12,7 @@ from dataclasses import replace
 from html import escape
 from inspect import iscoroutinefunction
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 from dotenv import load_dotenv
 from telegram import (
@@ -318,10 +318,22 @@ def build_cancel_job_keyboard(job_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def build_failed_job_keyboard(job_id: str) -> InlineKeyboardMarkup:
+def build_failed_job_keyboard(
+    job_id: str, *, settings_changed: bool = False
+) -> InlineKeyboardMarkup:
+    retry_row = [
+        InlineKeyboardButton(
+            "按原配置重试" if settings_changed else "重试任务",
+            callback_data=f"job:retry:{job_id}",
+        )
+    ]
+    if settings_changed:
+        retry_row.append(
+            InlineKeyboardButton("用当前配置重试", callback_data=f"job:retrycur:{job_id}")
+        )
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("重试任务", callback_data=f"job:retry:{job_id}")],
+            retry_row,
             [
                 InlineKeyboardButton("打开设置", callback_data="settings"),
                 InlineKeyboardButton("返回首页", callback_data="home"),
@@ -426,6 +438,33 @@ def render_channel_health(
         ]
     )
     return "\n".join(lines)
+
+
+def _current_output_snapshot(bot_data: Mapping) -> dict[str, str]:
+    config_store = bot_data.get("config_store")
+    if config_store is None:
+        return {}
+    return config_store.get().output_snapshot()
+
+
+def _settings_changed(bot_data: Mapping, job: TelegramJob) -> bool:
+    """Whether the job's frozen output settings differ from the current ones.
+
+    Jobs created before snapshots existed have none and follow current
+    settings, so they never count as changed.
+    """
+    if not job.settings_snapshot:
+        return False
+    current = _current_output_snapshot(bot_data)
+    return bool(current) and any(
+        str(job.settings_snapshot.get(name, "")) != value
+        for name, value in current.items()
+    )
+
+
+def _snapshot_model_line(snapshot: Mapping) -> str:
+    model = str((snapshot or {}).get("model_name") or "")
+    return f"\n模型：{html_code(model)}" if model else ""
 
 
 def render_job_failure(stage: str, reason: str) -> str:
@@ -966,7 +1005,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         manager.cancel(job_id)
         await query.message.reply_text(f"已请求取消任务 {job_id[:8]}。")
         return
-    if data.startswith("job:retry:"):
+    if data.startswith(("job:retry:", "job:retrycur:")):
+        use_current = data.startswith("job:retrycur:")
         job_id = data.split(":", 2)[-1]
         job = manager.get(job_id)
         if job is None or job.user_id != user.id:
@@ -985,6 +1025,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 job_id,
                 source_type_override=detected_source or job.source_type,
                 status_message_id=getattr(status_message, "message_id", 0) or 0,
+                settings_snapshot_override=(
+                    _current_output_snapshot(context.application.bot_data)
+                    if use_current
+                    else None
+                ),
             )
         except (ValueError, KeyError) as exc:
             reason = str(exc) if isinstance(exc, ValueError) else "任务不存在。"
@@ -992,7 +1037,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await _edit_message(
             status_message,
-            f"<b>任务已重新排队</b>\n任务：{html_code(retried.job_id[:8])}\n"
+            f"<b>任务已重新排队</b>\n任务：{html_code(retried.job_id[:8])}"
+            f"{_snapshot_model_line(retried.settings_snapshot)}\n"
             f"当前位置：{manager.queue_position(retried.job_id)}",
             build_cancel_job_keyboard(retried.job_id),
         )
@@ -1225,6 +1271,7 @@ async def _enqueue_job(
             original_filename=original_filename,
             source_message_id=getattr(message, "message_id", 0) or 0,
             status_message_id=getattr(status_message, "message_id", 0) or 0,
+            settings_snapshot=_current_output_snapshot(context.application.bot_data),
         )
     except QueueFull as exc:
         await _edit_message(
@@ -1238,7 +1285,8 @@ async def _enqueue_job(
     position = manager.queue_position(job.job_id)
     try:
         await status_message.edit_text(
-            f"<b>排队中</b>\n任务：{html_code(job.job_id[:8])}\n当前位置：{position}",
+            f"<b>排队中</b>\n任务：{html_code(job.job_id[:8])}"
+            f"{_snapshot_model_line(job.settings_snapshot)}\n当前位置：{position}",
             parse_mode=ParseMode.HTML,
             reply_markup=build_cancel_job_keyboard(job.job_id),
         )
@@ -1451,6 +1499,7 @@ async def _execute_job(
         audio_path=Path(job.audio_path) if job.audio_path else None,
         original_filename=job.original_filename or None,
         cleanup_input=bool(job.audio_path),
+        settings_snapshot=job.settings_snapshot or None,
     )
     try:
         async_execute = getattr(service, "execute_async", None)
@@ -1722,7 +1771,10 @@ async def _on_job_update(
             application,
             job,
             render_job_failure(job.stage, reason),
-            build_failed_job_keyboard(job.job_id),
+            build_failed_job_keyboard(
+                job.job_id,
+                settings_changed=_settings_changed(application.bot_data, job),
+            ),
         )
 
 
@@ -1787,7 +1839,10 @@ async def initialize_services(application: Application) -> None:
             await application.bot.send_message(
                 chat_id=job.chat_id,
                 text=f"任务 {job.job_id[:8]} 因服务重启而中断。",
-                reply_markup=build_failed_job_keyboard(job.job_id),
+                reply_markup=build_failed_job_keyboard(
+                    job.job_id,
+                    settings_changed=_settings_changed(application.bot_data, job),
+                ),
             )
             application.bot_data["job_manager"].mark_restart_notified(job.job_id)
         except Exception:

@@ -86,6 +86,29 @@ class TranscriptionServiceTest(unittest.TestCase):
             self.assertIn(source, result.cleanup_paths)
             self.assertIn("transcribing", statuses)
 
+    def test_settings_snapshot_overrides_current_output_settings(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            service, functions = self.make_service(root, language_hint="en")
+            service.execute(
+                TranscriptionRequest(
+                    source_type="youtube",
+                    text_input="https://www.youtube.com/watch?v=abc",
+                    settings_snapshot={
+                        "model_name": "frozen-model",
+                        "language_hint": "",
+                        "prompt_append": "keep names",
+                        "prompt_override": "",
+                    },
+                )
+            )
+            kwargs = functions.calls[-1][1]
+            self.assertEqual(kwargs["model_name"], "frozen-model")
+            self.assertIsNone(kwargs["language_hint"])
+            self.assertEqual(kwargs["promoters"], "keep names")
+            # Credentials still come from the live settings.
+            self.assertEqual(kwargs["api_key"], "key-a")
+
     def test_youtube_round_robins_between_tasks(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

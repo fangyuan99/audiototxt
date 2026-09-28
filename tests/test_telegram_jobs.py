@@ -44,6 +44,36 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [first.job_id, third.job_id, second.job_id])
         self.assertTrue(all(job.status == "succeeded" for job in manager.snapshot()))
 
+    async def test_retry_keeps_or_replaces_settings_snapshot(self):
+        async def executor(job, cancelled):
+            raise RuntimeError("boom")
+
+        manager = TelegramJobManager(JobStore(self.root / "jobs.json"), executor)
+        job = manager.enqueue(
+            user_id=1,
+            chat_id=1,
+            source_type="youtube",
+            text_input="a",
+            settings_snapshot={"model_name": "old-model"},
+        )
+        await manager.start()
+        await manager.join()
+
+        same = manager.retry(job.job_id)
+        self.assertEqual(same.settings_snapshot, {"model_name": "old-model"})
+        manager.cancel(same.job_id)
+        await manager.join()
+        current = manager.retry(
+            job.job_id, settings_snapshot_override={"model_name": "new-model"}
+        )
+        self.assertEqual(current.settings_snapshot, {"model_name": "new-model"})
+        await manager.join()
+        await manager.stop()
+
+        reloaded = JobStore(self.root / "jobs.json").load()
+        self.assertEqual(reloaded[job.job_id].settings_snapshot, {"model_name": "old-model"})
+        self.assertNotIn("gemini_api_keys", str(reloaded[job.job_id].to_dict()))
+
     async def test_single_user_jobs_stay_in_submission_order(self):
         calls = []
 

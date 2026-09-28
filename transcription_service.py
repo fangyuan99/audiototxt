@@ -4,7 +4,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
 
 from key_pool import GeminiKeyPool
@@ -49,6 +49,8 @@ class TranscriptionRequest:
     audio_path: Optional[Path] = None
     original_filename: Optional[str] = None
     cleanup_input: bool = False
+    # Output settings frozen at submit time; credentials always come live.
+    settings_snapshot: Optional[Mapping[str, str]] = None
 
 
 # Finish reasons that mean the provider ended the answer normally. Anything
@@ -349,7 +351,9 @@ class TranscriptionService:
         )
         emit = on_status or (lambda status: None)
         self._check(cancelled, active_deadline)
-        settings = self.config_store.get()
+        settings = self.config_store.get().with_output_snapshot(
+            request.settings_snapshot
+        )
         cleanup_paths: list[Path] = []
         source_type = request.source_type
 

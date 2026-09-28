@@ -7,7 +7,7 @@ import re
 import tempfile
 import threading
 import uuid
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -74,6 +74,9 @@ class TelegramJob:
     error_message: str = ""
     attempts: int = 0
     retry_of: str = ""
+    # Output settings (model, language, prompts) frozen at submit. Never
+    # holds credentials.
+    settings_snapshot: dict = field(default_factory=dict)
     # Delivery runs after the job succeeds: "", pending, sending, delivered
     # or failed. delivered_chunks lets a resend resume where it stopped.
     delivery_status: str = ""
@@ -226,6 +229,7 @@ class TelegramJobManager:
         source_message_id: int = 0,
         status_message_id: int = 0,
         retry_of: str = "",
+        settings_snapshot: Optional[dict] = None,
     ) -> TelegramJob:
         now = _utc_now()
         with self._lock:
@@ -243,6 +247,7 @@ class TelegramJobManager:
                 source_message_id=int(source_message_id or 0),
                 status_message_id=int(status_message_id or 0),
                 retry_of=retry_of or "",
+                settings_snapshot=dict(settings_snapshot or {}),
                 created_at=now,
                 updated_at=now,
             )
@@ -481,7 +486,10 @@ class TelegramJobManager:
         *,
         source_type_override: Optional[str] = None,
         status_message_id: Optional[int] = None,
+        settings_snapshot_override: Optional[dict] = None,
     ) -> TelegramJob:
+        """Re-enqueue a job, reusing its original settings snapshot unless
+        ``settings_snapshot_override`` is given."""
         # Hold the lock across the check and enqueue so repeated clicks
         # cannot create more than one active retry for the same job.
         with self._lock:
@@ -519,6 +527,11 @@ class TelegramJobManager:
                     else int(status_message_id or 0)
                 ),
                 retry_of=original.job_id,
+                settings_snapshot=(
+                    original.settings_snapshot
+                    if settings_snapshot_override is None
+                    else settings_snapshot_override
+                ),
             )
 
     async def start(self) -> None:

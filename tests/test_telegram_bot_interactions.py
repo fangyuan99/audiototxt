@@ -14,6 +14,8 @@ from channel_health import ChannelHealthResult
 from key_pool import GeminiKeyPool
 from service_config import GlobalConfigStore
 from telegram_bot import (
+    _settings_changed,
+    build_failed_job_keyboard,
     JobExecutionFailure,
     MODEL_CHOICES_KEY,
     PENDING_ACTION_KEY,
@@ -368,10 +370,65 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
             original.job_id,
             source_type_override="youtube",
             status_message_id=99,
+            settings_snapshot_override=None,
         )
         self.assertNotEqual(status_card.message_id, 987)
         self.assertIn("任务已重新排队", status_card.text)
         self.assertEqual(message.edits, [])
+
+    async def test_retry_with_current_settings_passes_live_snapshot(self):
+        self.config_store.update(model_name="new-model")
+        original = TelegramJob(
+            job_id="failed-job",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="youtube",
+            text_input="https://www.youtube.com/watch?v=example",
+            status="failed",
+            settings_snapshot={"model_name": "old-model"},
+        )
+        retried = TelegramJob(
+            job_id="retried-job",
+            sequence=2,
+            user_id=42,
+            chat_id=42,
+            source_type="youtube",
+            settings_snapshot={"model_name": "new-model"},
+        )
+        manager = SimpleNamespace(
+            get=lambda job_id: original if job_id == original.job_id else None,
+            retry=unittest.mock.Mock(return_value=retried),
+            queue_position=lambda job_id: 1,
+        )
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        self.assertTrue(_settings_changed(self.bot_data, original))
+        keyboard = build_failed_job_keyboard(original.job_id, settings_changed=True)
+        callbacks = [button.callback_data for button in keyboard.inline_keyboard[0]]
+        self.assertEqual(
+            callbacks, ["job:retry:failed-job", "job:retrycur:failed-job"]
+        )
+
+        message = FakeMessage()
+        query = SimpleNamespace(
+            data=f"job:retrycur:{original.job_id}", message=message, answer=AsyncMock()
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+        await handle_callback_query(update, FakeContext(self.bot_data))
+
+        override = manager.retry.call_args.kwargs["settings_snapshot_override"]
+        self.assertEqual(override["model_name"], "new-model")
+        self.assertNotIn("gemini_api_keys", override)
+        self.assertIn("new-model", message.replies[-1][2].text)
+
+    async def test_jobs_without_snapshot_never_offer_current_settings(self):
+        job = TelegramJob(job_id="j", sequence=1, user_id=1, chat_id=1, source_type="youtube")
+        self.config_store.update(model_name="another")
+        self.assertFalse(_settings_changed(self.bot_data, job))
 
     async def test_duplicate_retry_reports_error_on_new_card(self):
         original = TelegramJob(
