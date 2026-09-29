@@ -4,7 +4,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
 
 from key_pool import GeminiKeyPool
@@ -49,6 +49,13 @@ class TranscriptionRequest:
     audio_path: Optional[Path] = None
     original_filename: Optional[str] = None
     cleanup_input: bool = False
+    # Output settings frozen at submit time; credentials always come live.
+    settings_snapshot: Optional[Mapping[str, str]] = None
+
+
+# Finish reasons that mean the provider ended the answer normally. Anything
+# else (MAX_TOKENS, SAFETY, RECITATION, ...) may leave the transcript cut off.
+COMPLETE_FINISH_REASONS = frozenset({"", "STOP", "FINISH_REASON_UNSPECIFIED"})
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,55 @@ class TranscriptionResult:
     transcript: str
     filename_stem: str
     cleanup_paths: tuple[Path, ...] = ()
+    finish_reason: str = ""
+
+    @property
+    def incomplete(self) -> bool:
+        return self.finish_reason not in COMPLETE_FINISH_REASONS
+
+
+PROGRESS_TAIL_CHARS = 200
+
+
+class _ProviderCall:
+    """Per-request hooks shared by every key-pool attempt."""
+
+    def __init__(
+        self,
+        cancelled: Optional[Callable[[], bool]],
+        deadline: "TaskDeadline",
+        on_progress: Optional[Callable[[int, str], None]] = None,
+    ) -> None:
+        self.cancelled = cancelled
+        self.deadline = deadline
+        self.on_progress = on_progress
+        self.finish_reason = ""
+        self.characters = 0
+        self.tail = ""
+
+    def begin_attempt(self) -> None:
+        # A key failover restarts the stream, so progress starts over.
+        self.characters = 0
+        self.tail = ""
+
+    def should_abort(self) -> bool:
+        return bool(
+            (self.cancelled is not None and self.cancelled())
+            or self.deadline.remaining() <= 0
+        )
+
+    def on_chunk(self, delta: str) -> None:
+        # Raising here aborts the provider stream mid-response.
+        if self.cancelled is not None and self.cancelled():
+            raise TaskCancelled("任务已取消。")
+        self.deadline.check()
+        self.characters += len(delta)
+        self.tail = (self.tail + delta)[-PROGRESS_TAIL_CHARS:]
+        if self.on_progress is not None:
+            self.on_progress(self.characters, self.tail)
+
+    def on_finish(self, reason: str) -> None:
+        self.finish_reason = reason or ""
 
 
 class _DefaultFunctions:
@@ -209,7 +265,13 @@ class TranscriptionService:
             return operation()
 
     @staticmethod
-    def _provider_kwargs(settings: GlobalSettings, deadline: TaskDeadline) -> dict:
+    def _provider_kwargs(
+        settings: GlobalSettings,
+        deadline: TaskDeadline,
+        call: _ProviderCall,
+    ) -> dict:
+        # Built once per provider attempt.
+        call.begin_attempt()
         return {
             "model_name": settings.model_name,
             "language_hint": settings.language_hint or None,
@@ -220,29 +282,48 @@ class TranscriptionService:
             "vertex_project": settings.vertex_project,
             "vertex_location": settings.vertex_location,
             "request_timeout_seconds": max(1.0, deadline.remaining()),
+            "on_chunk": call.on_chunk,
+            "on_finish": call.on_finish,
         }
+
+    def _call_provider(
+        self,
+        function: Callable[..., str],
+        settings: GlobalSettings,
+        deadline: TaskDeadline,
+        call: _ProviderCall,
+        **source,
+    ) -> str:
+        if settings.auth_mode == "vertex_ai_json":
+            return function(
+                api_key=None,
+                **source,
+                **self._provider_kwargs(settings, deadline, call),
+            )
+
+        self.key_pool.sync(settings.gemini_api_keys)
+        return self.key_pool.run(
+            lambda key: function(
+                api_key=key,
+                **source,
+                **self._provider_kwargs(settings, deadline, call),
+            ),
+            should_abort=call.should_abort,
+        )
 
     def _transcribe_audio(
         self,
         path: Path,
         settings: GlobalSettings,
         deadline: TaskDeadline,
+        call: _ProviderCall,
     ) -> str:
-        common = self._provider_kwargs(settings, deadline)
-        if settings.auth_mode == "vertex_ai_json":
-            return self.functions.transcribe_audio(
-                api_key=None,
-                audio_path=str(path),
-                **common,
-            )
-
-        self.key_pool.sync(settings.gemini_api_keys)
-        return self.key_pool.run(
-            lambda key: self.functions.transcribe_audio(
-                api_key=key,
-                audio_path=str(path),
-                **self._provider_kwargs(settings, deadline),
-            )
+        return self._call_provider(
+            self.functions.transcribe_audio,
+            settings,
+            deadline,
+            call,
+            audio_path=str(path),
         )
 
     def _transcribe_youtube(
@@ -250,23 +331,28 @@ class TranscriptionService:
         value: str,
         settings: GlobalSettings,
         deadline: TaskDeadline,
+        call: _ProviderCall,
     ) -> str:
-        common = self._provider_kwargs(settings, deadline)
-        if settings.auth_mode == "vertex_ai_json":
-            return self.functions.transcribe_youtube(
-                api_key=None,
-                youtube_url=value,
-                **common,
-            )
-
-        self.key_pool.sync(settings.gemini_api_keys)
-        return self.key_pool.run(
-            lambda key: self.functions.transcribe_youtube(
-                api_key=key,
-                youtube_url=value,
-                **self._provider_kwargs(settings, deadline),
-            )
+        return self._call_provider(
+            self.functions.transcribe_youtube,
+            settings,
+            deadline,
+            call,
+            youtube_url=value,
         )
+
+    @staticmethod
+    def _raise_if_cancelled(
+        exc: BaseException,
+        cancelled: Optional[Callable[[], bool]],
+        cleanup_paths: list[Path],
+    ) -> None:
+        if cancelled is None or not cancelled():
+            return
+        TranscriptionService._cleanup_cancelled_paths(cleanup_paths)
+        if isinstance(exc, TaskCancelled):
+            raise exc
+        raise TaskCancelled("任务已取消。") from exc
 
     def execute(
         self,
@@ -275,13 +361,18 @@ class TranscriptionService:
         on_status: Optional[Callable[[str], None]] = None,
         cancelled: Optional[Callable[[], bool]] = None,
         deadline: Optional[TaskDeadline] = None,
+        on_progress: Optional[Callable[[int, str], None]] = None,
     ) -> TranscriptionResult:
+        """Run one request. ``on_progress(characters, tail)`` fires on every
+        streamed chunk from the worker thread; callers must throttle."""
         active_deadline = deadline or TaskDeadline(
             self.media_policy.task_timeout_seconds
         )
         emit = on_status or (lambda status: None)
         self._check(cancelled, active_deadline)
-        settings = self.config_store.get()
+        settings = self.config_store.get().with_output_snapshot(
+            request.settings_snapshot
+        )
         cleanup_paths: list[Path] = []
         source_type = request.source_type
 
@@ -289,15 +380,21 @@ class TranscriptionService:
             if not request.text_input:
                 raise ValueError("缺少 YouTube 链接。")
             emit("transcribing")
-            transcript = self._require_transcript(
-                self._transcribe_youtube(
-                    request.text_input, settings, active_deadline
+            call = _ProviderCall(cancelled, active_deadline, on_progress)
+            try:
+                transcript = self._require_transcript(
+                    self._transcribe_youtube(
+                        request.text_input, settings, active_deadline, call
+                    )
                 )
-            )
-            self._check(cancelled, active_deadline)
+                self._check(cancelled, active_deadline)
+            except Exception as exc:
+                self._raise_if_cancelled(exc, cancelled, [])
+                raise
             return TranscriptionResult(
                 transcript=transcript,
                 filename_stem=_youtube_stem(request.text_input),
+                finish_reason=call.finish_reason,
             )
 
         audio_path = request.audio_path
@@ -378,20 +475,18 @@ class TranscriptionService:
 
         self._check(cancelled, active_deadline)
         emit("transcribing")
+        call = _ProviderCall(cancelled, active_deadline, on_progress)
         try:
             transcript = self._require_transcript(
-                self._transcribe_audio(audio_path, settings, active_deadline)
+                self._transcribe_audio(audio_path, settings, active_deadline, call)
             )
             self._check(cancelled, active_deadline)
         except Exception as exc:
-            if cancelled is not None and cancelled():
-                self._cleanup_cancelled_paths(cleanup_paths)
-                if isinstance(exc, TaskCancelled):
-                    raise
-                raise TaskCancelled("任务已取消。") from exc
+            self._raise_if_cancelled(exc, cancelled, cleanup_paths)
             raise
         return TranscriptionResult(
             transcript=transcript,
             filename_stem=filename_stem,
             cleanup_paths=tuple(dict.fromkeys(cleanup_paths)),
+            finish_reason=call.finish_reason,
         )

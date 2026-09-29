@@ -3,16 +3,17 @@ import unittest
 from channel_health import ChannelHealthResult
 from key_pool import GeminiKeyPool
 from service_config import GlobalSettings
+from telegram_delivery import StoredResult
 from telegram_bot import (
     BOT_COMMANDS,
     MAX_TELEGRAM_TEXT,
-    ResultCache,
     build_help_text,
     build_home_keyboard,
     build_model_keyboard,
     build_settings_keyboard,
     render_channel_health,
     render_job_failure,
+    render_result_completion,
     render_settings,
     split_telegram_text,
 )
@@ -60,7 +61,7 @@ class TelegramBotFormattingTest(unittest.TestCase):
             for row in build_home_keyboard().inline_keyboard
             for button in row
         }
-        self.assertEqual(home_callbacks, {"home:status", "settings", "queue", "help"})
+        self.assertEqual(home_callbacks, {"home:status", "settings", "queue", "history", "help"})
 
         settings_callbacks = {
             button.callback_data
@@ -138,24 +139,13 @@ class TelegramBotFormattingTest(unittest.TestCase):
         self.assertIn("model:page:1", callbacks)
         self.assertIn("model:manual", callbacks)
 
-    def test_result_cache_is_bounded_and_expires(self):
-        now = [100.0]
-        cache = ResultCache(max_entries=2, max_characters=8, ttl_seconds=10, clock=lambda: now[0])
-        cache.put("one", "1234")
-        cache.put("two", "5678")
-        cache.put("three", "abcd")
-        self.assertIsNone(cache.get("one"))
-        self.assertEqual(cache.get("three"), "abcd")
-        now[0] += 11
-        self.assertIsNone(cache.get("three"))
+    def test_completion_warns_when_result_may_be_truncated(self):
+        complete = render_result_completion(StoredResult("x", "a", "STOP"))
+        truncated = render_result_completion(StoredResult("x", "a", "MAX_TOKENS"))
 
-    def test_result_cache_keeps_one_oversized_result_without_truncating(self):
-        cache = ResultCache(max_entries=2, max_characters=8)
-        transcript = "完整结果" * 10
-
-        cache.put("large", transcript)
-
-        self.assertEqual(cache.get("large"), transcript)
+        self.assertNotIn("不完整", complete)
+        self.assertIn("不完整", truncated)
+        self.assertIn("MAX_TOKENS", truncated)
 
     def test_split_telegram_text_preserves_every_character(self):
         transcript = "甲" * 2900 + "\n\n" + "乙" * 2500 + "🙂" * 900

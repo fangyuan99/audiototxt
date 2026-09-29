@@ -266,24 +266,51 @@ def wait_for_file_active(client, file_obj, timeout_seconds: int = 120) -> None:
             pass
 
 
-def _collect_stream_text(response_stream, on_chunk=None) -> str:
-    """Collect streamed Gemini text while emitting only new deltas."""
+def _finish_reason_name(chunk) -> str:
+    try:
+        candidates = getattr(chunk, "candidates", None) or []
+        reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+    except Exception:
+        return ""
+    if reason is None:
+        return ""
+    name = getattr(reason, "name", None) or str(reason)
+    return name.rsplit(".", 1)[-1].upper()
+
+
+def _chunk_text(chunk) -> str:
+    text_piece = getattr(chunk, "text", None)
+    if text_piece:
+        return text_piece
+    try:
+        candidates = getattr(chunk, "candidates", [])
+        if candidates and candidates[0].content and candidates[0].content.parts:
+            return "".join(
+                part.text
+                for part in candidates[0].content.parts
+                if hasattr(part, "text")
+            )
+    except Exception:
+        pass
+    return ""
+
+
+def _collect_stream_text(response_stream, on_chunk=None, on_finish=None) -> str:
+    """Collect streamed Gemini text while emitting only new deltas.
+
+    ``on_chunk`` may raise to abort the stream (cancellation or deadline).
+    ``on_finish`` receives the provider finish reason, e.g. ``STOP`` or
+    ``MAX_TOKENS``, or an empty string when the provider did not report one.
+    """
     emitted_text = ""
     full_parts = []
-    for chunk in response_stream:
-        text_piece = getattr(chunk, "text", None)
-        if not text_piece:
-            try:
-                candidates = getattr(chunk, "candidates", [])
-                if candidates and candidates[0].content and candidates[0].content.parts:
-                    text_piece = "".join(
-                        part.text
-                        for part in candidates[0].content.parts
-                        if hasattr(part, "text")
-                    )
-            except Exception:
-                text_piece = None
-        if text_piece:
+    finish_reason = ""
+    try:
+        for chunk in response_stream:
+            finish_reason = _finish_reason_name(chunk) or finish_reason
+            text_piece = _chunk_text(chunk)
+            if not text_piece:
+                continue
             if emitted_text and text_piece.startswith(emitted_text):
                 delta = text_piece[len(emitted_text):]
             else:
@@ -295,7 +322,15 @@ def _collect_stream_text(response_stream, on_chunk=None) -> str:
                     print(delta, end="", flush=True)
                 full_parts.append(delta)
                 emitted_text += delta
-
+    finally:
+        close = getattr(response_stream, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+    if on_finish:
+        on_finish(finish_reason)
     return "".join(full_parts).strip()
 
 
@@ -357,6 +392,62 @@ def _youtube_output_stem(youtube_url: str) -> str:
     return f"youtube_{int(time.time())}"
 
 
+# Inline requests are capped at 100 MB after base64 encoding (~4/3 growth),
+# so raw audio above this goes through the Files API instead.
+INLINE_AUDIO_MAX_BYTES = 72 * 1024 * 1024
+FILE_ACTIVE_POLL_SECONDS = 2.0
+
+
+class InlineAudioTooLarge(RuntimeError):
+    """Audio exceeds the inline limit and no Files API is available."""
+
+
+def _file_state_name(uploaded) -> str:
+    state = getattr(uploaded, "state", None)
+    return str(getattr(state, "name", state) or "").upper()
+
+
+def _upload_audio_file(
+    client,
+    audio_path: str,
+    mime_type: str,
+    *,
+    timeout_seconds: Optional[float],
+    checkpoint=None,
+    sleep=time.sleep,
+    clock=time.monotonic,
+):
+    """Upload via the Files API and wait until the file is usable.
+
+    The caller must delete the returned file. ``checkpoint`` is invoked while
+    waiting so cancellation and deadlines still apply.
+    """
+    uploaded = client.files.upload(file=audio_path, config={"mime_type": mime_type})
+    try:
+        deadline = clock() + (timeout_seconds or 600)
+        while _file_state_name(uploaded) == "PROCESSING":
+            if checkpoint is not None:
+                checkpoint("")
+            if clock() >= deadline:
+                raise TimeoutError("音频文件处理超时")
+            sleep(FILE_ACTIVE_POLL_SECONDS)
+            uploaded = client.files.get(name=uploaded.name)
+        if _file_state_name(uploaded) == "FAILED":
+            raise RuntimeError("Gemini 无法处理上传的音频文件")
+    except BaseException:
+        _delete_uploaded_file(client, uploaded)
+        raise
+    return uploaded
+
+
+def _delete_uploaded_file(client, uploaded) -> None:
+    try:
+        client.files.delete(name=uploaded.name)
+    except Exception:
+        # Files expire on their own after 48 hours.
+        pass
+
+
 def transcribe_audio_streaming(
     api_key: Optional[str],
     audio_path: str,
@@ -370,11 +461,12 @@ def transcribe_audio_streaming(
     vertex_location: Optional[str] = None,
     full_prompt_override: Optional[str] = None,
     request_timeout_seconds: Optional[float] = None,
+    on_finish=None,
 ) -> str:
     """Use Gemini to transcribe an audio file into text with streaming output.
 
-    Uses inline bytes so the audio can be sent without uploading a file object.
-    Returns the full transcript while yielding chunks via on_chunk or stdout.
+    Audio up to INLINE_AUDIO_MAX_BYTES is sent inline; larger files are
+    uploaded through the Files API (Gemini API key mode only). Returns the full transcript while yielding chunks via on_chunk or stdout.
     """
     from google.genai import types
 
@@ -388,11 +480,24 @@ def transcribe_audio_streaming(
     if not os.path.isfile(audio_path):
         raise FileNotFoundError(f"找不到音频文件：{audio_path}")
 
+    try:
+        audio_size = os.path.getsize(audio_path)
+    except OSError as e:
+        raise RuntimeError("无法读取音频文件") from e
+    use_files_api = audio_size > INLINE_AUDIO_MAX_BYTES
+    if use_files_api and auth_config.auth_mode == AUTH_MODE_VERTEX_AI_JSON:
+        raise InlineAudioTooLarge(
+            "Vertex AI 模式下音频不能超过 "
+            f"{INLINE_AUDIO_MAX_BYTES // (1024 * 1024)} MB"
+        )
+
     # 读取音频文件并构建 inline bytes 输入
     try:
         print(f"读取音频：{os.path.basename(audio_path)}", file=sys.stderr)
-        with open(audio_path, 'rb') as audio_file:
-            audio_data = audio_file.read()
+        audio_data = b""
+        if not use_files_api:
+            with open(audio_path, 'rb') as audio_file:
+                audio_data = audio_file.read()
 
         # 检测音频文件类型
         file_ext = os.path.splitext(audio_path)[1].lower()
@@ -403,7 +508,12 @@ def transcribe_audio_streaming(
             '.flac': 'audio/flac',
             '.ogg': 'audio/ogg',
             '.aac': 'audio/aac',
-            '.opus': 'audio/opus'
+            '.opus': 'audio/opus',
+            # Gemini transcribes the audio track of video files directly.
+            '.mp4': 'video/mp4',
+            '.mov': 'video/quicktime',
+            '.webm': 'video/webm',
+            '.3gp': 'video/3gpp',
         }
         mime_type = mime_type_map.get(file_ext, 'audio/mp3')  # 默认为 mp3
         
@@ -416,29 +526,45 @@ def transcribe_audio_streaming(
         full_override=full_prompt_override,
     )
 
-    content_data = types.Part.from_bytes(data=audio_data, mime_type=mime_type)
     config = _build_generate_content_config(types)
     client = build_genai_client(auth_config, timeout_seconds=request_timeout_seconds)
+    uploaded = None
 
     try:
-        print("开始转写...", file=sys.stderr)
-    except Exception:
-        pass
-    
-    try:
+        if use_files_api:
+            print("音频较大，通过 Files API 上传...", file=sys.stderr)
+            uploaded = _upload_audio_file(
+                client,
+                audio_path,
+                mime_type,
+                timeout_seconds=request_timeout_seconds,
+                checkpoint=on_chunk,
+            )
+            content_data = uploaded
+        else:
+            content_data = types.Part.from_bytes(data=audio_data, mime_type=mime_type)
+        try:
+            print("开始转写...", file=sys.stderr)
+        except Exception:
+            pass
+
         response_stream = client.models.generate_content_stream(
             model=model_name,
             contents=[content_data, full_prompt],
             config=config,
         )
 
-        transcript = _collect_stream_text(response_stream, on_chunk=on_chunk)
+        transcript = _collect_stream_text(
+            response_stream, on_chunk=on_chunk, on_finish=on_finish
+        )
         try:
             print(f"转写完成（约 {len(transcript)} 字符）", file=sys.stderr)
         except Exception:
             pass
         return transcript
     finally:
+        if uploaded is not None:
+            _delete_uploaded_file(client, uploaded)
         try:
             client.close()
         except Exception:
@@ -459,6 +585,7 @@ def transcribe_youtube_url_streaming(
     media_resolution: Optional[str] = "low",
     full_prompt_override: Optional[str] = None,
     request_timeout_seconds: Optional[float] = None,
+    on_finish=None,
 ) -> str:
     """Use Gemini to transcribe a public YouTube URL directly without downloading."""
     from google.genai import types
@@ -486,7 +613,9 @@ def transcribe_youtube_url_streaming(
             contents=[full_prompt, video_part],
             config=config,
         )
-        transcript = _collect_stream_text(response_stream, on_chunk=on_chunk)
+        transcript = _collect_stream_text(
+            response_stream, on_chunk=on_chunk, on_finish=on_finish
+        )
         try:
             print(f"转写完成（约 {len(transcript)} 字符）", file=sys.stderr)
         except Exception:

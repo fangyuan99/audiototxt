@@ -3,29 +3,43 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+from telegram.error import BadRequest, RetryAfter
 
 from bot_state import BotStateStore
 from channel_health import ChannelHealthResult
 from key_pool import GeminiKeyPool
 from service_config import GlobalConfigStore
 from telegram_bot import (
+    _download_telegram_audio,
+    _history_text,
+    render_job_progress,
+    _settings_changed,
+    build_failed_job_keyboard,
     JobExecutionFailure,
     MODEL_CHOICES_KEY,
     PENDING_ACTION_KEY,
-    ResultCache,
-    _deliver_result,
+    _deliver_job,
     _execute_job,
     _handle_setting_input,
     _on_job_update,
+    _resume_undelivered,
     build_application,
+    cancel_command,
+    handle_audio_message,
     handle_callback_query,
     handle_text_message,
+    handle_unsupported_message,
+    split_telegram_text,
     start_command,
 )
-from telegram_jobs import TelegramJob
-from transcription_service import TranscriptionResult
+from telegram_delivery import ChatSender, ResultStore
+from media_policy import DownloadLimitExceeded
+from telegram_jobs import JobStore, TelegramJob, TelegramJobManager
+from transcription_service import TaskCancelled, TranscriptionResult
 
 
 class FakeMessage:
@@ -57,6 +71,11 @@ class FakeContext:
         self.application = SimpleNamespace(bot_data=bot_data)
         self.user_data = {}
         self.args = []
+
+
+async def drain_background(bot_data):
+    tasks = list(bot_data.get("background_tasks", ()))
+    await asyncio.gather(*tasks)
 
 
 def make_update(message, user_id=42, chat_type="private"):
@@ -178,6 +197,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         handled = await _handle_setting_input(
             make_update(message), context, "vertex_json", message.text
         )
+        await drain_background(self.bot_data)
 
         stored = self.config_store.get()
         self.assertTrue(handled)
@@ -192,6 +212,35 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
             + [edit[0] for _, _, reply in message.replies for edit in reply.edits]
         )
         self.assertIn("当前渠道可用", rendered)
+
+    async def test_key_validation_runs_without_blocking_the_handler(self):
+        import threading
+
+        release = threading.Event()
+
+        def validator(key):
+            release.wait(5)
+            return key != "bad-key"
+
+        self.bot_data["key_validator"] = validator
+        message = FakeMessage("good-key-1,bad-key,good-key-2")
+        context = FakeContext(self.bot_data)
+        context.user_data[PENDING_ACTION_KEY] = "keys_replace"
+
+        handled = await _handle_setting_input(
+            make_update(message), context, "keys_replace", message.text
+        )
+
+        self.assertTrue(handled)
+        self.assertNotIn(PENDING_ACTION_KEY, context.user_data)
+        self.assertEqual(self.config_store.get().gemini_api_keys, [])
+        self.assertIn("正在验证 3 个 Key", message.replies[-1][0])
+
+        release.set()
+        await drain_background(self.bot_data)
+        self.assertEqual(
+            self.config_store.get().gemini_api_keys, ["good-key-1", "good-key-2"]
+        )
 
     async def test_vertex_project_edit_probes_vertex_even_when_gemini_selected(self):
         captured = []
@@ -220,6 +269,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         await _handle_setting_input(
             make_update(message), context, "vertex_project", message.text
         )
+        await drain_background(self.bot_data)
 
         self.assertEqual(self.config_store.get().auth_mode, "gemini_api_key")
         self.assertEqual(captured[-1].auth_mode, "vertex_ai_json")
@@ -261,6 +311,7 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         )
 
         await handle_callback_query(update, context)
+        await drain_background(self.bot_data)
 
         self.assertEqual(captured[-1].auth_mode, "vertex_ai_json")
         self.assertEqual(
@@ -304,12 +355,13 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
         )
 
         await handle_callback_query(update, context)
+        await drain_background(self.bot_data)
 
         self.assertEqual(context.user_data[PENDING_ACTION_KEY], "model_manual")
         self.assertIn("直接发送模型名称", message.replies[-1][0])
         self.assertNotIn("secret provider response", message.replies[-1][0])
 
-    async def test_retry_binds_new_job_to_clicked_message(self):
+    async def test_retry_binds_new_job_to_its_own_status_card(self):
         original = TelegramJob(
             job_id="failed-job",
             sequence=1,
@@ -354,142 +406,848 @@ class TelegramBotInteractionTest(unittest.IsolatedAsyncioTestCase):
 
         await handle_callback_query(update, context)
 
+        status_card = message.replies[-1][2]
+        status_card.message_id = 555
         manager.retry.assert_called_once_with(
             original.job_id,
             source_type_override="youtube",
-            status_message_id=987,
+            status_message_id=99,
+            settings_snapshot_override=None,
+            force_fresh=False,
         )
-        self.assertIn("任务已重新排队", message.replies[-1][0])
+        self.assertNotEqual(status_card.message_id, 987)
+        self.assertIn("任务已重新排队", status_card.text)
+        self.assertEqual(message.edits, [])
 
-    async def test_execute_job_delivers_before_returning_success(self):
+    async def test_retry_with_current_settings_passes_live_snapshot(self):
+        self.config_store.update(model_name="new-model")
+        original = TelegramJob(
+            job_id="failed-job",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="youtube",
+            text_input="https://www.youtube.com/watch?v=example",
+            status="failed",
+            settings_snapshot={"model_name": "old-model"},
+        )
+        retried = TelegramJob(
+            job_id="retried-job",
+            sequence=2,
+            user_id=42,
+            chat_id=42,
+            source_type="youtube",
+            settings_snapshot={"model_name": "new-model"},
+        )
+        manager = SimpleNamespace(
+            get=lambda job_id: original if job_id == original.job_id else None,
+            retry=unittest.mock.Mock(return_value=retried),
+            queue_position=lambda job_id: 1,
+        )
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        self.assertTrue(_settings_changed(self.bot_data, original))
+        keyboard = build_failed_job_keyboard(original.job_id, settings_changed=True)
+        callbacks = [button.callback_data for button in keyboard.inline_keyboard[0]]
+        self.assertEqual(
+            callbacks, ["job:retry:failed-job", "job:retrycur:failed-job"]
+        )
+
+        message = FakeMessage()
+        query = SimpleNamespace(
+            data=f"job:retrycur:{original.job_id}", message=message, answer=AsyncMock()
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+        await handle_callback_query(update, FakeContext(self.bot_data))
+
+        override = manager.retry.call_args.kwargs["settings_snapshot_override"]
+        self.assertEqual(override["model_name"], "new-model")
+        self.assertNotIn("gemini_api_keys", override)
+        self.assertIn("new-model", message.replies[-1][2].text)
+
+    async def test_jobs_without_snapshot_never_offer_current_settings(self):
+        job = TelegramJob(job_id="j", sequence=1, user_id=1, chat_id=1, source_type="youtube")
+        self.config_store.update(model_name="another")
+        self.assertFalse(_settings_changed(self.bot_data, job))
+
+    async def test_duplicate_retry_reports_error_on_new_card(self):
+        original = TelegramJob(
+            job_id="failed-job",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="youtube",
+            text_input="https://www.youtube.com/watch?v=example",
+            status="failed",
+        )
+        manager = SimpleNamespace(
+            get=lambda job_id: original,
+            retry=unittest.mock.Mock(
+                side_effect=ValueError("该任务已在重试中：abcd1234，请勿重复提交。")
+            ),
+        )
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        context = FakeContext(self.bot_data)
+        message = FakeMessage()
+        query = SimpleNamespace(
+            data=f"job:retry:{original.job_id}",
+            message=message,
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+
+        await handle_callback_query(update, context)
+
+        self.assertIn("已在重试中", message.replies[-1][2].text)
+
+    async def test_navigation_ends_pending_input_so_link_is_transcribed(self):
+        manager = SimpleNamespace(
+            snapshot=lambda: [],
+            enqueue=unittest.mock.Mock(
+                return_value=TelegramJob(
+                    job_id="new-job",
+                    sequence=1,
+                    user_id=42,
+                    chat_id=42,
+                    source_type="youtube",
+                )
+            ),
+            queue_position=lambda job_id: 1,
+        )
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        context = FakeContext(self.bot_data)
+        context.user_data[PENDING_ACTION_KEY] = "prompt_append"
+        query = SimpleNamespace(
+            data="home",
+            message=FakeMessage(),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+
+        await handle_callback_query(update, context)
+        self.assertNotIn(PENDING_ACTION_KEY, context.user_data)
+
+        link = FakeMessage("https://www.youtube.com/watch?v=abc")
+        await handle_text_message(make_update(link), context)
+
+        manager.enqueue.assert_called_once()
+        self.assertEqual(self.config_store.get().prompt_append, "")
+
+    async def test_cancel_with_pending_input_does_not_cancel_job(self):
+        manager = SimpleNamespace(cancel=unittest.mock.Mock())
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        context = FakeContext(self.bot_data)
+        context.user_data[PENDING_ACTION_KEY] = "prompt_append"
+        message = FakeMessage("/cancel")
+
+        with patch("telegram_bot._latest_user_job") as latest:
+            await cancel_command(make_update(message), context)
+
+        latest.assert_not_called()
+        manager.cancel.assert_not_called()
+        self.assertNotIn(PENDING_ACTION_KEY, context.user_data)
+        self.assertIn("已退出输入", message.replies[-1][0])
+
+    async def test_audio_message_enqueues_without_downloading(self):
+        manager = SimpleNamespace(
+            enqueue=unittest.mock.Mock(
+                return_value=TelegramJob(
+                    job_id="audio-job",
+                    sequence=1,
+                    user_id=42,
+                    chat_id=42,
+                    source_type="audio",
+                )
+            ),
+            queue_position=lambda job_id: 1,
+        )
+        self.bot_data.update(
+            {
+                "allowed_user_ids": {42},
+                "job_manager": manager,
+                "media_policy": SimpleNamespace(max_media_bytes=100 * 1024 * 1024),
+            }
+        )
+        context = FakeContext(self.bot_data)
+        message = FakeMessage()
+        get_file = AsyncMock()
+        message.audio = SimpleNamespace(
+            file_id="file-abc",
+            file_size=1024,
+            file_name="meeting.m4a",
+            get_file=get_file,
+        )
+        message.voice = None
+        message.document = None
+
+        await handle_audio_message(make_update(message), context)
+
+        get_file.assert_not_awaited()
+        kwargs = manager.enqueue.call_args.kwargs
+        self.assertEqual(kwargs["telegram_file_id"], "file-abc")
+        self.assertEqual(kwargs["audio_path"], "")
+        self.assertIn("已接收", message.replies[0][0])
+
+    async def test_audio_over_bot_api_limit_is_rejected_immediately(self):
+        manager = SimpleNamespace(enqueue=unittest.mock.Mock())
+        self.bot_data.update(
+            {
+                "allowed_user_ids": {42},
+                "job_manager": manager,
+                "media_policy": SimpleNamespace(max_media_bytes=100 * 1024 * 1024),
+            }
+        )
+        context = FakeContext(self.bot_data)
+        message = FakeMessage()
+        message.audio = SimpleNamespace(
+            file_id="file-big", file_size=25 * 1024 * 1024, file_name="big.mp3"
+        )
+        message.voice = None
+        message.document = None
+
+        await handle_audio_message(make_update(message), context)
+
+        manager.enqueue.assert_not_called()
+        self.assertIn("20 MB", message.replies[-1][0])
+
+    async def test_video_message_is_enqueued_as_media(self):
+        manager = SimpleNamespace(
+            enqueue=unittest.mock.Mock(
+                return_value=TelegramJob(
+                    job_id="video-job", sequence=1, user_id=42, chat_id=42,
+                    source_type="audio",
+                )
+            ),
+            queue_position=lambda job_id: 1,
+        )
+        self.bot_data.update(
+            {
+                "allowed_user_ids": {42},
+                "job_manager": manager,
+                "media_policy": SimpleNamespace(max_media_bytes=100 * 1024 * 1024),
+            }
+        )
+        message = FakeMessage()
+        message.audio = message.voice = message.document = None
+        message.video = SimpleNamespace(file_id="vid", file_size=2048, file_name=None)
+
+        await handle_audio_message(make_update(message), FakeContext(self.bot_data))
+
+        kwargs = manager.enqueue.call_args.kwargs
+        self.assertEqual(kwargs["telegram_file_id"], "vid")
+        self.assertEqual(kwargs["original_filename"], "video.mp4")
+
+    async def test_full_queue_is_reported_on_status_card(self):
+        from telegram_jobs import QueueFull
+
+        manager = SimpleNamespace(
+            enqueue=unittest.mock.Mock(side_effect=QueueFull("任务队列已满，请稍后再试。"))
+        )
+        self.bot_data.update({"allowed_user_ids": {42}, "job_manager": manager})
+        message = FakeMessage("https://www.youtube.com/watch?v=abc")
+
+        await handle_text_message(make_update(message), FakeContext(self.bot_data))
+
+        card = message.replies[0][2]
+        self.assertIn("队列已满", card.text)
+        self.assertIn("未加入队列", card.text)
+
+    async def test_unsupported_message_gets_guidance(self):
+        self.bot_data["allowed_user_ids"] = {42}
+        message = FakeMessage()
+
+        await handle_unsupported_message(make_update(message), FakeContext(self.bot_data))
+
+        self.assertIn("暂不支持", message.replies[0][0])
+
+    def _real_manager_application(self, service, bot=None):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+        store = ResultStore(self.root / "results")
+        application = SimpleNamespace(
+            bot=bot or SimpleNamespace(edit_message_text=AsyncMock()),
+            bot_data={
+                **self.bot_data,
+                "transcription_service": service,
+                "media_policy": SimpleNamespace(task_timeout_seconds=10),
+                "job_manager": manager,
+                "result_store": store,
+                "allowed_user_ids": {42},
+            },
+        )
+        return manager, store, application
+
+    async def test_identical_request_reuses_stored_result(self):
         class FakeService:
-            def execute(self, request, **kwargs):
-                kwargs["on_status"]("transcribing")
-                return TranscriptionResult("transcript", "result")
+            calls = 0
 
             async def execute_async(self, request, **kwargs):
-                return self.execute(request, **kwargs)
+                FakeService.calls += 1
+                return TranscriptionResult("fresh text", "fresh")
+
+        service = FakeService()
+        manager, store, application = self._real_manager_application(service)
+
+        def submit(**kwargs):
+            return manager.enqueue(
+                user_id=42, chat_id=42, source_type="youtube",
+                text_input="https://youtu.be/x", source_identity="text:https://youtu.be/x",
+                settings_snapshot={"model_name": "m1"}, **kwargs,
+            )
+
+        first = submit()
+        manager._set_status(first.job_id, "succeeded")
+        store.save(first.job_id, "old text", filename_stem="talk", finish_reason="STOP")
+
+        second = submit()
+        result = await _execute_job(application, manager.get(second.job_id), lambda: False)
+
+        self.assertEqual(FakeService.calls, 0)
+        self.assertEqual(result.transcript, "old text")
+        self.assertEqual(store.load(second.job_id).transcript, "old text")
+        self.assertEqual(manager.get(second.job_id).reused_from, first.job_id)
+        self.assertEqual(manager.get(second.job_id).delivery_status, "pending")
+
+        manager._set_status(second.job_id, "succeeded")
+        fresh = manager.retry(second.job_id, force_fresh=True)
+        result = await _execute_job(application, fresh, lambda: False)
+        self.assertEqual(FakeService.calls, 1)
+        self.assertEqual(result.transcript, "fresh text")
+
+    async def test_history_lists_results_and_delete_removes_them(self):
+        manager, store, application = self._real_manager_application(None)
+        kept = manager.enqueue(
+            user_id=42, chat_id=42, source_type="audio", original_filename="meeting.m4a"
+        )
+        expired = manager.enqueue(user_id=42, chat_id=42, source_type="youtube")
+        other_user = manager.enqueue(user_id=7, chat_id=7, source_type="youtube")
+        for job in (kept, expired, other_user):
+            manager._set_status(job.job_id, "succeeded")
+        store.save(kept.job_id, "text", filename_stem="meeting")
+        store.save(other_user.job_id, "text", filename_stem="x")
+
+        text, markup = _history_text(manager, store, 42)
+        self.assertIn("meeting.m4a", text)
+        self.assertNotIn(expired.job_id[:8], text)
+        self.assertNotIn(other_user.job_id[:8], text)
+        callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn(f"result:doc:{kept.job_id}", callbacks)
+
+        message = FakeMessage()
+        query = SimpleNamespace(
+            data=f"result:del:{kept.job_id}", message=message, answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=42, type="private"),
+        )
+        await handle_callback_query(update, FakeContext(application.bot_data))
+
+        self.assertFalse(store.exists(kept.job_id))
+        self.assertEqual(manager.get(kept.job_id).delivery_status, "deleted")
+
+    def _download_application(self, telegram_file, *, transport=None, max_bytes=10**7):
+        uploads = self.root / "uploads"
+        uploads.mkdir(exist_ok=True)
+        return SimpleNamespace(
+            bot=SimpleNamespace(get_file=AsyncMock(return_value=telegram_file)),
+            bot_data={
+                "media_policy": SimpleNamespace(max_media_bytes=max_bytes),
+                "paths": SimpleNamespace(uploads_dir=uploads),
+                "download_transport": transport,
+            },
+        )
+
+    def _download_job(self):
+        return TelegramJob(
+            job_id="dl", sequence=1, user_id=42, chat_id=42, source_type="audio",
+            telegram_file_id="file-abc", original_filename="talk.m4a",
+        )
+
+    async def test_download_streams_in_chunks_and_reports_bytes(self):
+        import httpx
+
+        body = b"a" * (600 * 1024)
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, content=body, headers={"content-length": str(len(body))}
+            )
+        )
+        telegram_file = SimpleNamespace(
+            file_size=len(body), file_path="https://api.telegram.org/file/botTOKEN/a.m4a"
+        )
+        application = self._download_application(telegram_file, transport=transport)
+        progress = []
+
+        path = await _download_telegram_audio(
+            application, self._download_job(),
+            on_progress=lambda received, total: progress.append((received, total)),
+        )
+
+        self.assertEqual(path.read_bytes(), body)
+        self.assertEqual(progress[-1], (len(body), len(body)))
+        self.assertGreater(len(progress), 1)
+
+    async def test_download_cancel_mid_stream_removes_partial_file(self):
+        import httpx
+
+        body = b"a" * (600 * 1024)
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, content=body))
+        telegram_file = SimpleNamespace(
+            file_size=0, file_path="https://api.telegram.org/file/botTOKEN/a.m4a"
+        )
+        application = self._download_application(telegram_file, transport=transport)
+        seen = []
+
+        with self.assertRaises(TaskCancelled):
+            await _download_telegram_audio(
+                application, self._download_job(),
+                cancelled=lambda: bool(seen),
+                on_progress=lambda received, total: seen.append(received),
+            )
+
+        self.assertEqual(list((self.root / "uploads").iterdir()), [])
+
+    async def test_download_errors_never_expose_the_token_url(self):
+        import httpx
+
+        def fail(request):
+            raise httpx.ConnectError(f"cannot reach {request.url}")
+
+        telegram_file = SimpleNamespace(
+            file_size=0, file_path="https://api.telegram.org/file/botSECRET/a.m4a"
+        )
+        application = self._download_application(
+            telegram_file, transport=httpx.MockTransport(fail)
+        )
+
+        with self.assertRaises(ConnectionError) as caught:
+            await _download_telegram_audio(application, self._download_job())
+
+        self.assertNotIn("SECRET", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    async def test_download_over_limit_is_rejected_from_content_length(self):
+        import httpx
+
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"a" * 2048)
+        )
+        telegram_file = SimpleNamespace(
+            file_size=0, file_path="https://api.telegram.org/file/botTOKEN/a.m4a"
+        )
+        application = self._download_application(
+            telegram_file, transport=transport, max_bytes=1024
+        )
+
+        with self.assertRaises(DownloadLimitExceeded):
+            await _download_telegram_audio(application, self._download_job())
+        self.assertEqual(list((self.root / "uploads").iterdir()), [])
+
+    async def test_local_path_download_can_be_cancelled(self):
+        async def download_to_drive(custom_path):
+            await asyncio.sleep(30)
+
+        telegram_file = SimpleNamespace(
+            file_size=5, file_path="/var/lib/telegram-bot-api/a.m4a",
+            download_to_drive=download_to_drive,
+        )
+        application = self._download_application(telegram_file)
+        started = asyncio.get_running_loop().time()
+
+        with self.assertRaises(TaskCancelled):
+            await _download_telegram_audio(
+                application, self._download_job(), cancelled=lambda: True
+            )
+
+        self.assertLess(asyncio.get_running_loop().time() - started, 5)
+
+    def test_progress_card_shows_download_bytes(self):
+        job = TelegramJob(job_id="abcdef123456", sequence=1, user_id=1, chat_id=1, source_type="audio")
+        text = render_job_progress(
+            job, "downloading", elapsed_seconds=3,
+            downloaded_bytes=3 * 1024 * 1024, total_bytes=12 * 1024 * 1024,
+        )
+        self.assertIn("已下载：3.0 MB / 12.0 MB", text)
+
+    def _audio_job_application(self, service, bot):
+        manager = SimpleNamespace(
+            stages=[],
+            update_stage=lambda job_id, stage: manager.stages.append(stage),
+            set_audio_path=lambda job_id, path: None,
+            update_delivery=lambda job_id, **changes: None,
+        )
+        uploads = self.root / "uploads"
+        uploads.mkdir(exist_ok=True)
+        return manager, SimpleNamespace(
+            bot_data={
+                "transcription_service": service,
+                "media_policy": SimpleNamespace(
+                    task_timeout_seconds=10, max_media_bytes=100 * 1024 * 1024
+                ),
+                "job_manager": manager,
+                "paths": SimpleNamespace(uploads_dir=uploads),
+                "result_store": ResultStore(self.root / "results"),
+            },
+            bot=bot,
+        )
+
+    async def test_execute_job_downloads_audio_in_worker(self):
+        requests = []
+
+        class FakeService:
+            async def execute_async(self, request, **kwargs):
+                requests.append(request)
+                return TranscriptionResult("transcript", "result")
+
+        async def download_to_drive(custom_path):
+            Path(custom_path).write_bytes(b"audio")
+
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(),
+            get_file=AsyncMock(
+                return_value=SimpleNamespace(
+                    file_size=5, download_to_drive=download_to_drive
+                )
+            ),
+        )
+        manager, application = self._audio_job_application(FakeService(), bot)
+        job = TelegramJob(
+            job_id="job-id",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="audio",
+            telegram_file_id="file-abc",
+            original_filename="meeting.m4a",
+        )
+
+        await _execute_job(application, job, lambda: False)
+
+        bot.get_file.assert_awaited_once_with("file-abc")
+        self.assertIn("downloading", manager.stages)
+        self.assertTrue(requests[0].audio_path.is_file())
+
+    async def test_execute_job_throttles_progress_edits(self):
+        class FakeService:
+            async def execute_async(self, request, *, on_status, on_progress, **kwargs):
+                on_status("transcribing")
+                for count in range(1, 51):
+                    on_progress(count, "<b>" + "字" * count)
+                return TranscriptionResult("transcript", "result")
+
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
+        _manager, application = self._audio_job_application(FakeService(), bot)
+        application.bot_data["progress_interval_seconds"] = 3600
+        job = TelegramJob(
+            job_id="job-id", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", text_input="https://youtu.be/x",
+            status_message_id=5, settings_snapshot={"model_name": "m-1"},
+        )
+
+        await _execute_job(application, job, lambda: False)
+        await asyncio.sleep(0)
+
+        # The stage change edits at once; 50 chunks inside the interval add
+        # nothing, and nothing edits the card after the job returns.
+        self.assertLessEqual(bot.edit_message_text.await_count, 1)
+
+    async def test_execute_job_redraws_card_while_provider_is_silent(self):
+        class FakeService:
+            async def execute_async(self, request, *, on_status, **kwargs):
+                on_status("transcribing")
+                await asyncio.sleep(0.35)
+                return TranscriptionResult("transcript", "result")
+
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
+        _manager, application = self._audio_job_application(FakeService(), bot)
+        application.bot_data["progress_interval_seconds"] = 0.1
+        job = TelegramJob(
+            job_id="job-id", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", text_input="https://youtu.be/x",
+            status_message_id=5, settings_snapshot={"model_name": "m-1"},
+        )
+
+        await _execute_job(application, job, lambda: False)
+        edits_at_return = bot.edit_message_text.await_count
+        await asyncio.sleep(0.25)
+
+        # No progress events arrive, yet the timer keeps redrawing the card,
+        # and it stops once the job returns.
+        self.assertGreaterEqual(edits_at_return, 3)
+        self.assertEqual(bot.edit_message_text.await_count, edits_at_return)
+
+    def test_progress_card_shows_real_counters_only(self):
+        job = TelegramJob(
+            job_id="abcdef123456", sequence=1, user_id=1, chat_id=1,
+            source_type="youtube", settings_snapshot={"model_name": "m-1"},
+        )
+        text = render_job_progress(
+            job, "transcribing", elapsed_seconds=65, characters=1234,
+            tail="x" * 300 + "\nline <script>",
+        )
+        self.assertIn("正在转写", text)
+        self.assertIn("m-1", text)
+        self.assertIn("1分05秒", text)
+        self.assertIn("1234 字", text)
+        self.assertIn("line &lt;script&gt;", text)
+        self.assertNotIn("%", text)
+        preview = text.split("<blockquote>")[1]
+        self.assertLessEqual(len(preview), 160)
+
+    async def test_execute_job_download_failure_is_reported_at_download_stage(self):
+        class FakeService:
+            async def execute_async(self, request, **kwargs):
+                raise AssertionError("must not transcribe")
+
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(),
+            get_file=AsyncMock(side_effect=BadRequest("File is too big")),
+        )
+        _manager, application = self._audio_job_application(FakeService(), bot)
+        job = TelegramJob(
+            job_id="job-id",
+            sequence=1,
+            user_id=42,
+            chat_id=42,
+            source_type="audio",
+            telegram_file_id="file-abc",
+        )
+
+        with self.assertRaises(JobExecutionFailure) as raised:
+            await _execute_job(application, job, lambda: False)
+
+        self.assertEqual(raised.exception.stage, "downloading")
+        self.assertEqual(raised.exception.error_code, "media_too_large")
+        self.assertEqual(list((self.root / "uploads").iterdir()), [])
+
+    async def test_execute_job_persists_result_and_leaves_delivery_to_worker(self):
+        class FakeService:
+            async def execute_async(self, request, **kwargs):
+                kwargs["on_status"]("transcribing")
+                return TranscriptionResult(
+                    "transcript", "result", finish_reason="MAX_TOKENS"
+                )
 
         class FakeManager:
             def __init__(self):
                 self.stages = []
+                self.delivery = {}
 
             def update_stage(self, job_id, stage):
                 self.stages.append(stage)
 
-            def get(self, job_id):
-                return SimpleNamespace(stage=self.stages[-1] if self.stages else "preparing")
+            def update_delivery(self, job_id, **changes):
+                self.delivery.update(changes)
 
         manager = FakeManager()
+        store = ResultStore(self.root / "results")
+        bot = SimpleNamespace(edit_message_text=AsyncMock(), send_message=AsyncMock())
         application = SimpleNamespace(
             bot_data={
                 "transcription_service": FakeService(),
                 "media_policy": SimpleNamespace(task_timeout_seconds=10),
                 "job_manager": manager,
+                "result_store": store,
             },
-            bot=SimpleNamespace(edit_message_text=AsyncMock()),
+            bot=bot,
         )
         job = TelegramJob(
-            job_id="job-id",
-            sequence=1,
-            user_id=42,
-            chat_id=42,
-            source_type="youtube",
+            job_id="job-id", sequence=1, user_id=42, chat_id=42, source_type="youtube"
         )
 
-        with patch("telegram_bot._deliver_result", new=AsyncMock()) as deliver:
-            result = await _execute_job(application, job, lambda: False)
+        result = await _execute_job(application, job, lambda: False)
 
         self.assertEqual(result.transcript, "transcript")
-        deliver.assert_awaited_once()
-        self.assertIn("transcribing", manager.stages)
-        self.assertEqual(manager.stages[-1], "delivering")
+        stored = store.load("job-id")
+        self.assertEqual(stored.transcript, "transcript")
+        self.assertTrue(stored.incomplete)
+        self.assertEqual(manager.delivery["delivery_status"], "pending")
+        self.assertNotIn("delivering", manager.stages)
+        bot.send_message.assert_not_awaited()
 
-    async def test_delivery_failure_is_wrapped_with_safe_stage(self):
-        class FakeService:
-            def execute(self, request, **kwargs):
-                return TranscriptionResult("transcript", "result")
-
-            async def execute_async(self, request, **kwargs):
-                return self.execute(request, **kwargs)
-
-        class FakeManager:
-            def __init__(self):
-                self.stage = "preparing"
-
-            def update_stage(self, job_id, stage):
-                self.stage = stage
+    def _delivery_application(self, job, transcript, bot, finish_reason=""):
+        class FakeDeliveryManager:
+            def __init__(self, job):
+                self.job = job
 
             def get(self, job_id):
-                return SimpleNamespace(stage=self.stage)
+                return replace(self.job) if job_id == self.job.job_id else None
 
-        application = SimpleNamespace(
-            bot_data={
-                "transcription_service": FakeService(),
-                "media_policy": SimpleNamespace(task_timeout_seconds=10),
-                "job_manager": FakeManager(),
-            },
-            bot=SimpleNamespace(edit_message_text=AsyncMock()),
+            def update_delivery(self, job_id, **changes):
+                for key, value in changes.items():
+                    setattr(self.job, key, value)
+                return replace(self.job)
+
+            def undelivered_jobs(self):
+                if self.job.delivery_status in {"pending", "sending"}:
+                    return [replace(self.job)]
+                return []
+
+        store = ResultStore(self.root / "results")
+        store.save(
+            job.job_id, transcript, filename_stem="talk", finish_reason=finish_reason
         )
-        job = TelegramJob(
-            job_id="job-id",
-            sequence=1,
-            user_id=42,
-            chat_id=42,
-            source_type="youtube",
-        )
-
-        with patch(
-            "telegram_bot._deliver_result",
-            new=AsyncMock(
-                side_effect=RuntimeError(
-                    "send failed https://example/get?token=secret"
-                )
-            ),
-        ):
-            with self.assertRaises(JobExecutionFailure) as raised:
-                await _execute_job(application, job, lambda: False)
-
-        self.assertEqual(raised.exception.stage, "delivering")
-        self.assertNotIn("token=secret", str(raised.exception))
-
-    async def test_long_result_is_sent_in_full_across_multiple_messages(self):
-        transcript = "第一段。" * 1000 + "\n\n" + "🙂" * 1500
-        bot = SimpleNamespace(
-            send_message=AsyncMock(),
-            send_document=AsyncMock(),
-            edit_message_text=AsyncMock(),
-        )
-        cache = ResultCache()
+        manager = FakeDeliveryManager(job)
         application = SimpleNamespace(
             bot=bot,
             bot_data={
-                "result_cache": cache,
-                "paths": SimpleNamespace(outputs_dir=self.root),
+                "job_manager": manager,
+                "result_store": store,
+                "chat_sender": ChatSender(min_interval_seconds=0, sleep=AsyncMock()),
+                "allowed_user_ids": {42},
+                **{key: value for key, value in self.bot_data.items() if key != "allowed_user_ids"},
             },
         )
+        return manager, application
+
+    @staticmethod
+    def _recording_bot(fail_at=()):
+        sent = []
+        attempts = {"count": 0}
+
+        async def send_message(chat_id, text, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] in fail_at:
+                raise BadRequest("Chat not found")
+            sent.append(text)
+
+        bot = SimpleNamespace(
+            send_message=send_message,
+            send_document=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        return bot, sent
+
+    async def test_long_result_is_sent_in_full_across_multiple_messages(self):
+        transcript = "第一段。" * 1000 + "\n\n" + "🙂" * 1500
+        bot, sent = self._recording_bot()
         job = TelegramJob(
-            job_id="long-result",
-            sequence=1,
-            user_id=42,
-            chat_id=42,
-            source_type="youtube",
+            job_id="long-result", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded", status_message_id=7,
         )
+        manager, application = self._delivery_application(job, transcript, bot)
 
-        await _deliver_result(
-            application,
-            job,
-            TranscriptionResult(transcript, "long-transcript"),
-        )
+        await _deliver_job(application, job.job_id)
 
-        sent_chunks = [
-            call.kwargs["text"] for call in bot.send_message.await_args_list
-        ]
-        self.assertGreater(len(sent_chunks), 1)
-        self.assertEqual("".join(sent_chunks), transcript)
-        self.assertNotIn("完整内容见", "".join(sent_chunks))
-        self.assertEqual(cache.get(job.job_id), transcript)
+        self.assertGreater(len(sent), 1)
+        self.assertEqual("".join(sent), transcript)
         bot.send_document.assert_awaited_once()
+        self.assertEqual(manager.job.delivery_status, "delivered")
+        final_markup = bot.edit_message_text.await_args.kwargs["reply_markup"]
+        callbacks = [b.callback_data for row in final_markup.inline_keyboard for b in row]
+        self.assertIn("result:full:long-result", callbacks)
+
+    async def test_failed_delivery_offers_resend_and_resumes_without_duplicates(self):
+        transcript = "第一段。" * 1000 + "\n\n" + "第二段。" * 1000
+        bot, sent = self._recording_bot(fail_at={2})
+        job = TelegramJob(
+            job_id="resend-me", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded", status_message_id=7,
+        )
+        manager, application = self._delivery_application(job, transcript, bot)
+
+        await _deliver_job(application, job.job_id)
+
+        self.assertEqual(manager.job.delivery_status, "failed")
+        self.assertEqual(manager.job.delivered_chunks, 1)
+        bot.send_document.assert_not_awaited()
+        edit = bot.edit_message_text.await_args.kwargs
+        self.assertIn("发送失败", edit["text"])
+        callbacks = [b.callback_data for row in edit["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("result:resend:resend-me", callbacks)
+
+        query = SimpleNamespace(
+            data="result:resend:resend-me",
+            answer=AsyncMock(),
+            message=FakeMessage(),
+            edit_message_text=AsyncMock(),
+        )
+        update = make_update(query.message)
+        update.callback_query = query
+        context = FakeContext(application.bot_data)
+        context.application = application
+        await handle_callback_query(update, context)
+        await asyncio.gather(*application.bot_data["delivery_tasks"].values())
+
+        self.assertEqual("".join(sent), transcript)
+        bot.send_document.assert_awaited_once()
+        self.assertEqual(manager.job.delivery_status, "delivered")
+
+    async def test_retry_after_is_honoured_during_delivery(self):
+        attempts = []
+
+        async def send_message(chat_id, text, **kwargs):
+            attempts.append(text)
+            if len(attempts) == 1:
+                raise RetryAfter(3)
+
+        bot = SimpleNamespace(
+            send_message=send_message,
+            send_document=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        job = TelegramJob(
+            job_id="flood", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded",
+        )
+        manager, application = self._delivery_application(job, "短结果", bot)
+
+        await _deliver_job(application, job.job_id)
+
+        self.assertEqual(attempts, ["短结果", "短结果"])
+        sleep = application.bot_data["chat_sender"]._sleep
+        sleep.assert_any_await(3.5)
+        self.assertEqual(manager.job.delivery_status, "delivered")
+
+    async def test_incomplete_result_is_flagged_on_status_card(self):
+        bot, _sent = self._recording_bot()
+        job = TelegramJob(
+            job_id="cut", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded", status_message_id=7,
+        )
+        _manager, application = self._delivery_application(
+            job, "被截断的", bot, finish_reason="MAX_TOKENS"
+        )
+
+        await _deliver_job(application, job.job_id)
+
+        self.assertIn("不完整", bot.edit_message_text.await_args.kwargs["text"])
+        self.assertIn("不完整", bot.send_document.await_args.kwargs["caption"])
+
+    async def test_restart_resumes_pending_delivery_from_saved_progress(self):
+        transcript = "第一段。" * 1000 + "\n\n" + "第二段。" * 1000
+        bot, sent = self._recording_bot()
+        job = TelegramJob(
+            job_id="resume", sequence=1, user_id=42, chat_id=42,
+            source_type="youtube", status="succeeded",
+            delivery_status="sending", delivered_chunks=1,
+        )
+        manager, application = self._delivery_application(job, transcript, bot)
+
+        self.assertEqual(_resume_undelivered(application), 1)
+        await asyncio.gather(*application.bot_data["delivery_tasks"].values())
+
+        store = application.bot_data["result_store"]
+        chunks = split_telegram_text(store.load("resume").transcript)
+        self.assertEqual(sent, chunks[1:])
+        self.assertEqual(manager.job.delivery_status, "delivered")
 
     async def test_terminal_timeout_logs_one_safe_structured_record(self):
         application = SimpleNamespace(

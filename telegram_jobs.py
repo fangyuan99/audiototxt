@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import tempfile
 import threading
+import time
 import uuid
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -64,6 +66,7 @@ class TelegramJob:
     source_type: str
     text_input: str = ""
     audio_path: str = ""
+    telegram_file_id: str = ""
     original_filename: str = ""
     source_message_id: int = 0
     status_message_id: int = 0
@@ -73,6 +76,21 @@ class TelegramJob:
     error_message: str = ""
     attempts: int = 0
     retry_of: str = ""
+    # Output settings (model, language, prompts) frozen at submit. Never
+    # holds credentials.
+    settings_snapshot: dict = field(default_factory=dict)
+    # What was transcribed: a Telegram file_unique_id or the submitted
+    # text. With the user and snapshot it forms content_key, which lets an
+    # identical request reuse a stored result unless force_fresh is set.
+    source_identity: str = ""
+    content_key: str = ""
+    force_fresh: bool = False
+    reused_from: str = ""
+    # Delivery runs after the job succeeds: "", pending, sending, delivered
+    # or failed. delivered_chunks lets a resend resume where it stopped.
+    delivery_status: str = ""
+    delivered_chunks: int = 0
+    document_sent: bool = False
     restart_notified: bool = False
     created_at: str = ""
     updated_at: str = ""
@@ -85,6 +103,17 @@ class TelegramJob:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def compute_content_key(user_id: int, source_identity: str, snapshot: dict) -> str:
+    if not source_identity:
+        return ""
+    payload = json.dumps(
+        [int(user_id), source_identity, dict(sorted((snapshot or {}).items()))],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class JobStore:
@@ -152,6 +181,13 @@ class JobStore:
                         pass
 
 
+ACTIVE_STATUSES = frozenset({"queued", "running", "cancelling"})
+
+
+class QueueFull(ValueError):
+    """Raised when enqueueing would exceed the global or per-user limit."""
+
+
 class TelegramJobManager:
     def __init__(
         self,
@@ -159,7 +195,11 @@ class TelegramJobManager:
         executor: Callable[[TelegramJob, Callable[[], bool]], Awaitable[object]],
         *,
         max_concurrent_jobs: int = 1,
+        max_active_jobs: int = 20,
+        max_active_jobs_per_user: int = 5,
         task_timeout_seconds: float = 1800.0,
+        save_interval_seconds: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
         on_update: Optional[
             Callable[[TelegramJob, str, object], Awaitable[None]]
         ] = None,
@@ -167,10 +207,22 @@ class TelegramJobManager:
         self.store = store
         self.executor = executor
         self.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
+        self.max_active_jobs = max(1, int(max_active_jobs))
+        self.max_active_jobs_per_user = max(1, int(max_active_jobs_per_user))
         self.task_timeout_seconds = max(0.001, float(task_timeout_seconds))
         self.on_update = on_update
+        # Stage and chunk-progress changes are coalesced into at most one
+        # write per interval; status transitions are always written at once.
+        self.save_interval_seconds = max(0.0, float(save_interval_seconds))
+        self._clock = clock
+        self._last_save = float("-inf")
+        self._dirty = False
         self._jobs = store.load()
+        # One token per enqueued job; workers pick the actual job fairly.
         self._queue: asyncio.Queue[str] = asyncio.Queue()
+        # user_id -> dispatch counter at their last start, for round-robin.
+        self._last_dispatch: dict[int, int] = {}
+        self._dispatch_counter = 0
         self._workers: list[asyncio.Task] = []
         self._notification_tasks: set[asyncio.Task] = set()
         self._cancel_events: dict[str, asyncio.Event] = {}
@@ -187,7 +239,7 @@ class TelegramJobManager:
                 job.updated_at = _utc_now()
                 changed = True
         if changed:
-            self.store.save(self._jobs)
+            self._persist_locked()
 
     def _next_sequence(self) -> int:
         return max((job.sequence for job in self._jobs.values()), default=0) + 1
@@ -200,13 +252,19 @@ class TelegramJobManager:
         source_type: str,
         text_input: str = "",
         audio_path: str = "",
+        telegram_file_id: str = "",
         original_filename: str = "",
         source_message_id: int = 0,
         status_message_id: int = 0,
         retry_of: str = "",
+        settings_snapshot: Optional[dict] = None,
+        source_identity: str = "",
+        force_fresh: bool = False,
     ) -> TelegramJob:
         now = _utc_now()
+        snapshot = dict(settings_snapshot or {})
         with self._lock:
+            self._check_capacity_locked(int(user_id))
             job = TelegramJob(
                 job_id=uuid.uuid4().hex,
                 sequence=self._next_sequence(),
@@ -215,17 +273,66 @@ class TelegramJobManager:
                 source_type=source_type,
                 text_input=text_input or "",
                 audio_path=audio_path or "",
+                telegram_file_id=telegram_file_id or "",
                 original_filename=original_filename or "",
                 source_message_id=int(source_message_id or 0),
                 status_message_id=int(status_message_id or 0),
                 retry_of=retry_of or "",
+                settings_snapshot=snapshot,
+                source_identity=source_identity or "",
+                content_key=compute_content_key(user_id, source_identity, snapshot),
+                force_fresh=bool(force_fresh),
                 created_at=now,
                 updated_at=now,
             )
             self._jobs[job.job_id] = job
-            self.store.save(self._jobs)
+            self._persist_locked()
             self._queue.put_nowait(job.job_id)
             return replace(job)
+
+    def _check_capacity_locked(self, user_id: int) -> None:
+        active = [job for job in self._jobs.values() if job.status in ACTIVE_STATUSES]
+        if sum(1 for job in active if job.user_id == user_id) >= self.max_active_jobs_per_user:
+            raise QueueFull(
+                f"你已有 {self.max_active_jobs_per_user} 个任务在排队或执行，"
+                "请等待完成或取消部分任务后再提交。"
+            )
+        if len(active) >= self.max_active_jobs:
+            raise QueueFull("任务队列已满，请稍后再试。")
+
+    def _dispatch_order_locked(self) -> list[TelegramJob]:
+        """Queued jobs in the order workers will start them.
+
+        Users take turns: the user who started a job least recently goes
+        first, and each user's own jobs stay in submission order.
+        """
+        per_user: dict[int, list[TelegramJob]] = {}
+        for job in sorted(self._jobs.values(), key=lambda item: item.sequence):
+            if job.status == "queued":
+                per_user.setdefault(job.user_id, []).append(job)
+        last = dict(self._last_dispatch)
+        counter = self._dispatch_counter
+        order: list[TelegramJob] = []
+        while per_user:
+            user_id = min(
+                per_user,
+                key=lambda uid: (last.get(uid, -1), per_user[uid][0].sequence),
+            )
+            order.append(per_user[user_id].pop(0))
+            if not per_user[user_id]:
+                del per_user[user_id]
+            counter += 1
+            last[user_id] = counter
+        return order
+
+    def _claim_next_locked(self) -> Optional[TelegramJob]:
+        order = self._dispatch_order_locked()
+        if not order:
+            return None
+        job = order[0]
+        self._dispatch_counter += 1
+        self._last_dispatch[job.user_id] = self._dispatch_counter
+        return job
 
     def get(self, job_id: str) -> Optional[TelegramJob]:
         with self._lock:
@@ -253,19 +360,26 @@ class TelegramJobManager:
                 return
             job.restart_notified = True
             job.updated_at = _utc_now()
-            self.store.save(self._jobs)
+            self._persist_locked()
 
     def prune_terminal(
         self,
         *,
         max_age_seconds: float = 24 * 3600,
+        succeeded_max_age_seconds: Optional[float] = None,
         now: Optional[datetime] = None,
     ) -> int:
+        """Drop old terminal jobs. Succeeded jobs may be kept longer so
+        their stored results stay reachable from the history list."""
         current = now or datetime.now(timezone.utc)
         if current.tzinfo is None:
             current = current.replace(tzinfo=timezone.utc)
-        cutoff = current.astimezone(timezone.utc).timestamp() - max(
-            0.0, float(max_age_seconds)
+        current_ts = current.astimezone(timezone.utc).timestamp()
+        cutoff = current_ts - max(0.0, float(max_age_seconds))
+        succeeded_cutoff = (
+            cutoff
+            if succeeded_max_age_seconds is None
+            else current_ts - max(0.0, float(succeeded_max_age_seconds))
         )
         terminal = {"succeeded", "failed", "cancelled", "interrupted"}
         with self._lock:
@@ -281,17 +395,19 @@ class TelegramJobManager:
                         updated = updated.replace(tzinfo=timezone.utc)
                 except ValueError:
                     continue
-                if updated.astimezone(timezone.utc).timestamp() < cutoff:
+                limit = succeeded_cutoff if job.status == "succeeded" else cutoff
+                if updated.astimezone(timezone.utc).timestamp() < limit:
                     expired.append(job_id)
             for job_id in expired:
                 self._jobs.pop(job_id, None)
                 self._cancel_events.pop(job_id, None)
             if expired:
-                self.store.save(self._jobs)
+                self._persist_locked()
             return len(expired)
 
     def queue_position(self, job_id: str) -> Optional[int]:
-        queued = [job for job in self.snapshot() if job.status == "queued"]
+        with self._lock:
+            queued = self._dispatch_order_locked()
         for index, job in enumerate(queued, start=1):
             if job.job_id == job_id:
                 return index
@@ -305,8 +421,103 @@ class TelegramJobManager:
             for key, value in changes.items():
                 if hasattr(job, key):
                     setattr(job, key, value)
-            self.store.save(self._jobs)
+            self._persist_locked()
             return replace(job)
+
+    def _persist_locked(self, *, critical: bool = True) -> None:
+        now = self._clock()
+        if critical or now - self._last_save >= self.save_interval_seconds:
+            self.store.save(self._jobs)
+            self._last_save = now
+            self._dirty = False
+        else:
+            self._dirty = True
+
+    def flush(self) -> None:
+        """Write any coalesced changes that have not reached disk yet."""
+        with self._lock:
+            if self._dirty:
+                self._persist_locked()
+
+    def set_audio_path(self, job_id: str, audio_path: str) -> Optional[TelegramJob]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            job.audio_path = audio_path or ""
+            job.updated_at = _utc_now()
+            self._persist_locked()
+            return replace(job)
+
+    def update_delivery(self, job_id: str, **changes) -> Optional[TelegramJob]:
+        allowed = {"delivery_status", "delivered_chunks", "document_sent"}
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            applied = {key for key in changes if key in allowed}
+            for key in applied:
+                setattr(job, key, changes[key])
+            job.updated_at = _utc_now()
+            # Per-chunk progress alone is not critical: losing it on a crash
+            # only means a resend may repeat a chunk or two.
+            self._persist_locked(critical=applied != {"delivered_chunks"})
+            return replace(job)
+
+    def find_reusable(
+        self,
+        job: TelegramJob,
+        has_result: Callable[[str], bool],
+    ) -> Optional[TelegramJob]:
+        """Newest earlier succeeded job with the same content key."""
+        if not job.content_key or job.force_fresh:
+            return None
+        with self._lock:
+            candidates = sorted(
+                (
+                    other
+                    for other in self._jobs.values()
+                    if other.job_id != job.job_id
+                    and other.status == "succeeded"
+                    and other.content_key == job.content_key
+                ),
+                key=lambda other: other.sequence,
+                reverse=True,
+            )
+            candidates = [replace(other) for other in candidates]
+        for candidate in candidates:
+            if has_result(candidate.job_id):
+                return candidate
+        return None
+
+    def mark_reused(self, job_id: str, source_job_id: str) -> Optional[TelegramJob]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            job.reused_from = source_job_id
+            job.updated_at = _utc_now()
+            self._persist_locked()
+            return replace(job)
+
+    def undelivered_jobs(self) -> list[TelegramJob]:
+        return [
+            job
+            for job in self.snapshot()
+            if job.status == "succeeded"
+            and job.delivery_status in {"pending", "sending"}
+        ]
+
+    def active_retry_of(self, job_id: str) -> Optional[TelegramJob]:
+        with self._lock:
+            for job in self._jobs.values():
+                if job.retry_of == job_id and job.status in {
+                    "queued",
+                    "running",
+                    "cancelling",
+                }:
+                    return replace(job)
+            return None
 
     def update_stage(self, job_id: str, stage: str) -> Optional[TelegramJob]:
         normalized = _safe_stage(stage, default="")
@@ -320,7 +531,7 @@ class TelegramJobManager:
                 return replace(job)
             job.stage = normalized
             job.updated_at = _utc_now()
-            self.store.save(self._jobs)
+            self._persist_locked(critical=False)
             return replace(job)
 
     async def _notify(self, job: TelegramJob, event: str, payload=None) -> None:
@@ -370,31 +581,62 @@ class TelegramJobManager:
         *,
         source_type_override: Optional[str] = None,
         status_message_id: Optional[int] = None,
+        settings_snapshot_override: Optional[dict] = None,
+        force_fresh: bool = False,
     ) -> TelegramJob:
-        original = self.get(job_id)
-        if original is None:
-            raise KeyError(job_id)
-        if original.status not in {"failed", "cancelled", "interrupted"}:
-            raise ValueError("只有失败、取消或中断的任务可以重试。")
-        if original.source_type == "audio" and (
-            not original.audio_path or not Path(original.audio_path).is_file()
-        ):
-            raise ValueError("原音频已过期，请重新发送文件。")
-        return self.enqueue(
-            user_id=original.user_id,
-            chat_id=original.chat_id,
-            source_type=source_type_override or original.source_type,
-            text_input=original.text_input,
-            audio_path=original.audio_path,
-            original_filename=original.original_filename,
-            source_message_id=original.source_message_id,
-            status_message_id=(
-                original.status_message_id
-                if status_message_id is None
-                else int(status_message_id or 0)
-            ),
-            retry_of=original.job_id,
-        )
+        """Re-enqueue a job, reusing its original settings snapshot unless
+        ``settings_snapshot_override`` is given.
+
+        ``force_fresh`` also accepts succeeded jobs and skips result reuse.
+        """
+        # Hold the lock across the check and enqueue so repeated clicks
+        # cannot create more than one active retry for the same job.
+        with self._lock:
+            original = self.get(job_id)
+            if original is None:
+                raise KeyError(job_id)
+            allowed = {"failed", "cancelled", "interrupted"}
+            if force_fresh:
+                allowed.add("succeeded")
+            if original.status not in allowed:
+                raise ValueError("只有失败、取消或中断的任务可以重试。")
+            existing = self.active_retry_of(job_id)
+            if existing is not None:
+                raise ValueError(
+                    f"该任务已在重试中：{existing.job_id[:8]}，请勿重复提交。"
+                )
+            audio_available = bool(original.audio_path) and Path(
+                original.audio_path
+            ).is_file()
+            if (
+                original.source_type == "audio"
+                and not audio_available
+                and not original.telegram_file_id
+            ):
+                raise ValueError("原音频已过期，请重新发送文件。")
+            return self.enqueue(
+                user_id=original.user_id,
+                chat_id=original.chat_id,
+                source_type=source_type_override or original.source_type,
+                text_input=original.text_input,
+                audio_path=original.audio_path if audio_available else "",
+                telegram_file_id=original.telegram_file_id,
+                original_filename=original.original_filename,
+                source_message_id=original.source_message_id,
+                status_message_id=(
+                    original.status_message_id
+                    if status_message_id is None
+                    else int(status_message_id or 0)
+                ),
+                retry_of=original.job_id,
+                settings_snapshot=(
+                    original.settings_snapshot
+                    if settings_snapshot_override is None
+                    else settings_snapshot_override
+                ),
+                source_identity=original.source_identity,
+                force_fresh=force_fresh,
+            )
 
     async def start(self) -> None:
         if self._started:
@@ -422,8 +664,8 @@ class TelegramJobManager:
                     job.restart_notified = False
                     job.updated_at = _utc_now()
                     changed = True
-            if changed:
-                self.store.save(self._jobs)
+            if changed or self._dirty:
+                self._persist_locked()
         if self._notification_tasks:
             await asyncio.gather(
                 *list(self._notification_tasks), return_exceptions=True
@@ -434,27 +676,28 @@ class TelegramJobManager:
 
     async def _worker(self, worker_index: int) -> None:
         while True:
-            job_id = await self._queue.get()
+            await self._queue.get()
+            job_id = ""
             try:
-                job = self.get(job_id)
-                if job is None or job.status != "queued":
-                    continue
-                cancel_event = self._cancel_events.setdefault(job_id, asyncio.Event())
-                if cancel_event.is_set():
-                    terminal = self._set_status(
-                        job_id, "cancelled", error_code="cancelled"
+                with self._lock:
+                    claimed = self._claim_next_locked()
+                    if claimed is None:
+                        # Its job was cancelled while queued.
+                        continue
+                    job_id = claimed.job_id
+                    cancel_event = self._cancel_events.setdefault(
+                        job_id, asyncio.Event()
                     )
-                    await self._notify(terminal, "cancelled")
-                    continue
-
-                running = self._set_status(
-                    job_id,
-                    "running",
-                    stage="preparing",
-                    attempts=job.attempts + 1,
-                    error_code="",
-                    error_message="",
-                )
+                    # Claim and mark running under one lock so no other
+                    # worker can start the same job.
+                    running = self._set_status(
+                        job_id,
+                        "running",
+                        stage="preparing",
+                        attempts=claimed.attempts + 1,
+                        error_code="",
+                        error_message="",
+                    )
                 await self._notify(running, "running")
                 try:
                     result = await asyncio.wait_for(
@@ -513,5 +756,6 @@ class TelegramJobManager:
                         )
                         await self._notify(terminal, "succeeded", result)
             finally:
-                self._cancel_events.pop(job_id, None)
+                if job_id:
+                    self._cancel_events.pop(job_id, None)
                 self._queue.task_done()

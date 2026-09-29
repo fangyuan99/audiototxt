@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import threading
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, MutableMapping, Optional
@@ -69,6 +69,9 @@ def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
                 pass
 
 
+OUTPUT_SETTING_FIELDS = ("model_name", "language_hint", "prompt_append", "prompt_override")
+
+
 @dataclass
 class GlobalSettings:
     schema_version: int = CONFIG_VERSION
@@ -99,6 +102,25 @@ class GlobalSettings:
         payload = asdict(self)
         payload["gemini_api_keys"] = parse_api_keys(self.gemini_api_keys)
         return payload
+
+    def output_snapshot(self) -> dict[str, str]:
+        """Settings that shape the transcript, frozen onto a job at submit.
+
+        Credentials are deliberately excluded so jobs never store secrets.
+        """
+        return {name: str(getattr(self, name) or "") for name in OUTPUT_SETTING_FIELDS}
+
+    def with_output_snapshot(self, snapshot: Optional[Mapping[str, object]]) -> "GlobalSettings":
+        if not snapshot:
+            return self
+        changes = {
+            name: str(snapshot[name] or "")
+            for name in OUTPUT_SETTING_FIELDS
+            if name in snapshot
+        }
+        if not changes.get("model_name", "x"):
+            changes.pop("model_name")
+        return replace(self, **changes)
 
 
 @dataclass(frozen=True)

@@ -16,7 +16,7 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temp_dir.cleanup()
 
-    async def test_fifo_order_and_positions(self):
+    async def test_users_take_turns_and_positions_match_dispatch(self):
         calls = []
 
         async def executor(job, cancelled):
@@ -34,15 +34,119 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
         third = manager.enqueue(user_id=2, chat_id=20, source_type="youtube", text_input="c")
 
         self.assertEqual(manager.queue_position(first.job_id), 1)
-        self.assertEqual(manager.queue_position(second.job_id), 2)
-        self.assertEqual(manager.queue_position(third.job_id), 3)
+        self.assertEqual(manager.queue_position(third.job_id), 2)
+        self.assertEqual(manager.queue_position(second.job_id), 3)
 
         await manager.start()
         await manager.join()
         await manager.stop()
 
-        self.assertEqual(calls, [first.job_id, second.job_id, third.job_id])
+        self.assertEqual(calls, [first.job_id, third.job_id, second.job_id])
         self.assertTrue(all(job.status == "succeeded" for job in manager.snapshot()))
+
+    async def test_retry_keeps_or_replaces_settings_snapshot(self):
+        async def executor(job, cancelled):
+            raise RuntimeError("boom")
+
+        manager = TelegramJobManager(JobStore(self.root / "jobs.json"), executor)
+        job = manager.enqueue(
+            user_id=1,
+            chat_id=1,
+            source_type="youtube",
+            text_input="a",
+            settings_snapshot={"model_name": "old-model"},
+        )
+        await manager.start()
+        await manager.join()
+
+        same = manager.retry(job.job_id)
+        self.assertEqual(same.settings_snapshot, {"model_name": "old-model"})
+        manager.cancel(same.job_id)
+        await manager.join()
+        current = manager.retry(
+            job.job_id, settings_snapshot_override={"model_name": "new-model"}
+        )
+        self.assertEqual(current.settings_snapshot, {"model_name": "new-model"})
+        await manager.join()
+        await manager.stop()
+
+        reloaded = JobStore(self.root / "jobs.json").load()
+        self.assertEqual(reloaded[job.job_id].settings_snapshot, {"model_name": "old-model"})
+        self.assertNotIn("gemini_api_keys", str(reloaded[job.job_id].to_dict()))
+
+    async def test_stage_and_chunk_updates_are_coalesced(self):
+        now = {"value": 0.0}
+        path = self.root / "jobs.json"
+        manager = TelegramJobManager(
+            JobStore(path),
+            lambda job, cancelled: None,
+            save_interval_seconds=10,
+            clock=lambda: now["value"],
+        )
+        job = manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="a")
+
+        def on_disk():
+            return JobStore(path).load()[job.job_id]
+
+        manager.update_stage(job.job_id, "transcribing")
+        self.assertEqual(on_disk().stage, "queued")
+        now["value"] = 11
+        manager.update_stage(job.job_id, "retrying")
+        self.assertEqual(on_disk().stage, "retrying")
+
+        manager._set_status(job.job_id, "succeeded")
+        manager.update_delivery(job.job_id, delivered_chunks=3)
+        self.assertEqual(on_disk().delivered_chunks, 0)
+        manager.flush()
+        self.assertEqual(on_disk().delivered_chunks, 3)
+
+        manager.update_delivery(job.job_id, delivered_chunks=4)
+        manager.update_delivery(job.job_id, delivery_status="delivered")
+        self.assertEqual(on_disk().delivered_chunks, 4)
+        self.assertEqual(on_disk().delivery_status, "delivered")
+
+    async def test_single_user_jobs_stay_in_submission_order(self):
+        calls = []
+
+        async def executor(job, cancelled):
+            calls.append(job.text_input)
+            return "ok"
+
+        manager = TelegramJobManager(JobStore(self.root / "jobs.json"), executor)
+        for text in "abc":
+            manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input=text)
+
+        await manager.start()
+        await manager.join()
+        await manager.stop()
+
+        self.assertEqual(calls, ["a", "b", "c"])
+
+    async def test_per_user_and_global_limits_reject_new_jobs(self):
+        from telegram_jobs import QueueFull
+
+        async def executor(job, cancelled):
+            return "ok"
+
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"),
+            executor,
+            max_active_jobs=3,
+            max_active_jobs_per_user=2,
+        )
+        manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="a")
+        manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="b")
+        with self.assertRaisesRegex(QueueFull, "2 个任务"):
+            manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="c")
+
+        manager.enqueue(user_id=2, chat_id=2, source_type="youtube", text_input="d")
+        with self.assertRaisesRegex(QueueFull, "队列已满"):
+            manager.enqueue(user_id=3, chat_id=3, source_type="youtube", text_input="e")
+
+        # Cancelled jobs free their slot.
+        queued = [job for job in manager.snapshot() if job.user_id == 1]
+        manager.cancel(queued[0].job_id)
+        manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="f")
 
     async def test_queued_job_can_be_cancelled(self):
         gate = asyncio.Event()
@@ -238,6 +342,78 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(manager.get(recent.job_id))
         self.assertEqual(manager.get(active.job_id).status, "queued")
 
+    async def test_succeeded_jobs_can_outlive_other_terminal_jobs(self):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+        failed = manager.enqueue(user_id=1, chat_id=1, source_type="youtube")
+        done = manager.enqueue(user_id=1, chat_id=1, source_type="youtube")
+        three_days = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        manager._set_status(failed.job_id, "failed", updated_at=three_days)
+        manager._set_status(done.job_id, "succeeded", updated_at=three_days)
+
+        manager.prune_terminal(
+            max_age_seconds=24 * 3600, succeeded_max_age_seconds=7 * 86400
+        )
+
+        self.assertIsNone(manager.get(failed.job_id))
+        self.assertIsNotNone(manager.get(done.job_id))
+
+    async def test_content_key_scopes_reuse_to_user_source_and_settings(self):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+
+        def submit(user_id=1, identity="tg:abc", model="m1", **kwargs):
+            return manager.enqueue(
+                user_id=user_id,
+                chat_id=user_id,
+                source_type="audio",
+                telegram_file_id="file-id",
+                source_identity=identity,
+                settings_snapshot={"model_name": model},
+                **kwargs,
+            )
+
+        first = submit()
+        manager._set_status(first.job_id, "succeeded")
+        same = submit()
+        self.assertEqual(same.content_key, first.content_key)
+        self.assertNotEqual(submit(model="m2").content_key, first.content_key)
+        self.assertNotEqual(submit(user_id=2).content_key, first.content_key)
+        self.assertNotEqual(submit(identity="tg:other").content_key, first.content_key)
+        self.assertEqual(submit(identity="").content_key, "")
+
+        self.assertEqual(
+            manager.find_reusable(same, lambda job_id: True).job_id, first.job_id
+        )
+        self.assertIsNone(manager.find_reusable(same, lambda job_id: False))
+        fresh = manager.retry(first.job_id, force_fresh=True)
+        self.assertTrue(fresh.force_fresh)
+        self.assertEqual(fresh.content_key, first.content_key)
+        self.assertIsNone(manager.find_reusable(fresh, lambda job_id: True))
+        with self.assertRaises(ValueError):
+            manager.retry(first.job_id)
+
+    async def test_delivery_progress_survives_restart(self):
+        async def executor(job, cancelled):
+            return "ok"
+
+        path = self.root / "jobs.json"
+        manager = TelegramJobManager(JobStore(path), executor)
+        pending = manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="a")
+        done = manager.enqueue(user_id=1, chat_id=1, source_type="youtube", text_input="b")
+        manager._set_status(pending.job_id, "succeeded")
+        manager._set_status(done.job_id, "succeeded")
+        manager.update_delivery(pending.job_id, delivery_status="sending", delivered_chunks=2)
+        manager.update_delivery(done.job_id, delivery_status="delivered")
+
+        reloaded = TelegramJobManager(JobStore(path), executor)
+
+        undelivered = reloaded.undelivered_jobs()
+        self.assertEqual([job.job_id for job in undelivered], [pending.job_id])
+        self.assertEqual(undelivered[0].delivered_chunks, 2)
+
     async def test_retry_clones_payload_with_new_id(self):
         manager = TelegramJobManager(
             JobStore(self.root / "jobs.json"), lambda job, cancelled: None
@@ -307,6 +483,44 @@ class TelegramJobManagerTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, "重新发送"):
             manager.retry(original.job_id)
+
+    async def test_retry_is_idempotent_while_retry_is_active(self):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+        original = manager.enqueue(
+            user_id=1,
+            chat_id=2,
+            source_type="video_url",
+            text_input="https://example.com/v.mp4",
+        )
+        manager._set_status(original.job_id, "failed", error_code="network")
+
+        first = manager.retry(original.job_id)
+        with self.assertRaisesRegex(ValueError, "已在重试中"):
+            manager.retry(original.job_id)
+
+        manager._set_status(first.job_id, "failed", error_code="network")
+        second = manager.retry(original.job_id)
+        self.assertNotEqual(second.job_id, first.job_id)
+
+    async def test_retry_audio_without_local_file_redownloads_by_file_id(self):
+        manager = TelegramJobManager(
+            JobStore(self.root / "jobs.json"), lambda job, cancelled: None
+        )
+        original = manager.enqueue(
+            user_id=1,
+            chat_id=2,
+            source_type="audio",
+            audio_path=str(self.root / "missing.mp3"),
+            telegram_file_id="file-123",
+        )
+        manager._set_status(original.job_id, "failed", error_code="network")
+
+        retried = manager.retry(original.job_id)
+
+        self.assertEqual(retried.telegram_file_id, "file-123")
+        self.assertEqual(retried.audio_path, "")
 
 
 if __name__ == "__main__":

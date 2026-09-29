@@ -84,13 +84,20 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
   ```
   - Required in `.env`: `ENV_BOT_TOKEN`, `ENV_BOT_SECRET`
   - IDs in `TG_ALLOWED_USER_IDS` enter directly; other private-chat users enter the password once. Changing the password invalidates old password grants
-  - Send audio, voice, YouTube, Douyin share text, or a public media URL directly; source type is detected automatically
+  - Send audio, voice, video files, video notes, YouTube, Douyin share text, or a public media URL directly; source type is detected automatically. Other message types get a short hint instead of silence. Telegram's hosted Bot API only lets bots download files up to 20 MB
+  - Audio up to about 72 MB is sent inline to Gemini; larger files use the Gemini Files API (API-key channel only) and the upload is deleted afterwards
   - `/settings` uses inline buttons for the global Gemini key pool, model, Prompt, language, and advanced Vertex settings
   - `/settings` → “测试当前渠道” sends only `hi` with the currently configured model and reports channel availability, region, and latency without exposing the response or credentials
   - The model menu remotely lists transcription-compatible models from the current Gemini or Vertex channel; manual model entry remains available
   - Saving Vertex JSON/project/location automatically runs the same Vertex probe; a blank location defaults to `global`
   - `GOOGLE_API_KEYS` and Telegram input accept comma-separated keys. Tasks rotate healthy keys and skip keys in cooldown/disabled state
   - Jobs are queued, cancellable, retryable, and use one compact status message. Long results are sent completely across multiple Telegram messages plus `.txt`, without preview truncation
+  - Queue limits: `TG_MAX_ACTIVE_JOBS` (default 20) queued or running jobs in total and `TG_MAX_ACTIVE_JOBS_PER_USER` (default 5) per user; `TG_MAX_CONCURRENT_JOBS` sets how many run at once. Users take turns, and each user's jobs keep submission order
+  - Each job freezes the model, language and Prompt at submit time (credentials are never stored in jobs). If settings change before a retry, the failure card offers “按原配置重试” and “用当前配置重试”
+  - The status card shows the stage, model, elapsed time, downloaded MB, characters generated and a short tail preview, edited at most every 5 seconds. Cancelling also stops a Telegram download mid-file
+  - Results are stored for 7 days. Delivery that fails (flood control, network) keeps the result and resumes from the last sent chunk via “重新发送结果”. Results may be marked incomplete when Gemini stops early
+  - “🗂 最近结果” on the home screen lists your results from the last 7 days with resend, TXT-only and delete buttons
+  - Sending the same source again (same Telegram file or identical link text) with the same settings reuses the stored result without calling Gemini; “🔁 重新转写” forces a fresh run
   - Failures identify the stage (parsing, download, audio extraction, transcription, or delivery); protected server logs record one sanitized diagnostic line per failed job
   - The bot supports private chats only. The command menu contains `/start`, `/settings`, `/help`, and `/cancel`
   - Run embedded polling only when both `WEB_ENABLED=true` and `TELEGRAM_EMBEDDED_ENABLED=true`; otherwise run `telegram_bot.py` separately
@@ -263,13 +270,20 @@ python main.py --video-url URL --proxy http://127.0.0.1:7890
   python telegram_bot.py
   ```
   - `TG_ALLOWED_USER_IDS` 中的账号直接进入；其他私聊用户输入一次 `ENV_BOT_SECRET`。服务端密码变化后旧授权自动失效
-  - 直接发送音频、语音、YouTube、抖音分享文案或公网媒体直链，机器人会自动识别来源
+  - 直接发送音频、语音、视频文件、圆形视频、YouTube、抖音分享文案或公网媒体直链，机器人会自动识别来源；其他类型的消息会收到提示。官方 Bot API 只允许机器人下载 20 MB 以内的文件
+  - 约 72 MB 以内的音频直接内联发送给 Gemini；更大的文件走 Gemini Files API（仅 API Key 渠道），转写后自动删除上传的文件
   - `/settings` 使用消息内按钮管理全局 Key 池、模型、Prompt、语言及 Vertex 高级设置
   - `/settings` 中的“测试当前渠道”会使用当前配置模型发送一句 `hi`，仅返回渠道可用性、地区和耗时，不展示响应正文或凭据
   - 模型菜单会从当前 Gemini 或 Vertex 渠道远程读取适合转写的模型，仍保留手动输入模型名
   - 保存 Vertex JSON、Project 或 Location 后会自动执行同样的 Vertex 测活；Location 留空时默认使用 `global`
   - `GOOGLE_API_KEYS` 和 Telegram 输入都支持逗号分隔多 Key；任务会健康轮询并跳过限流、额度不足或失效 Key
   - 任务支持排队、取消和重试；过程中只更新一条状态消息，长文本会拆成多条 Telegram 消息完整发送，并附带 `.txt`，不再截断预览
+  - 队列上限：总共最多 `TG_MAX_ACTIVE_JOBS`（默认 20）个排队或执行中的任务，每个用户最多 `TG_MAX_ACTIVE_JOBS_PER_USER`（默认 5）个；`TG_MAX_CONCURRENT_JOBS` 控制同时执行的数量。多个用户轮流执行，同一用户的任务按提交顺序执行
+  - 提交时固定模型、语言和 Prompt（任务记录不保存任何凭据）。重试前如果设置有变，失败卡片会同时提供“按原配置重试”和“用当前配置重试”
+  - 状态卡片显示阶段、模型、已用时、已下载 MB、已生成字数和末尾预览，最多每 5 秒更新一次；下载 Telegram 文件途中也能立即取消
+  - 结果保存 7 天。发送失败（限流或网络问题）时结果不会丢，点“重新发送结果”会从上次发送到的位置继续；Gemini 提前结束时会提示结果可能不完整
+  - 首页的“🗂 最近结果”列出最近 7 天的结果，可重发、只发 TXT 文件或删除
+  - 用相同设置再次发送同一来源（同一个 Telegram 文件或完全相同的链接文字）会直接复用已保存的结果，不再调用 Gemini；点“🔁 重新转写”可强制重新生成
   - 失败消息会指出解析、下载、抽音、转写或结果发送阶段；受保护的服务日志为每个失败任务记录一条脱敏诊断
   - 仅支持私聊；命令菜单只包含 `/start`、`/settings`、`/help`、`/cancel`
   - 只有同时设置 `WEB_ENABLED=true` 与 `TELEGRAM_EMBEDDED_ENABLED=true` 才会随 Web 启动嵌入式 polling
